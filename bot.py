@@ -170,10 +170,10 @@ tags, NOT Markdown. Use these tags:\
 9. **Chart / Token Analysis (IMPORTANT)** – When the message contains a \
 "=== LIVE TOKEN DATA ===" block, you MUST use that data to provide a real \
 technical analysis. This data is fetched live from DexScreener at the moment \
-of the question. Users often paste just a contract address (CA) with no \
-additional text — treat that as an implicit request for token analysis. \
-NEVER tell the user you need a "LIVE TOKEN DATA block" — that's an internal \
-mechanism. If the block is present, just analyze the data. You MUST:\
+of the question. NEVER mention "LIVE TOKEN DATA", "data block", or any \
+internal mechanism to the user — just analyze the data directly. \
+If the block is present, it means we successfully looked up their token. \
+You MUST:\
   • State the token name, price, and chain right away\
   • Analyze momentum based on 5m/1h/6h/24h price changes\
   • Assess volume (is it healthy relative to liquidity? buy vs sell ratio?)\
@@ -261,6 +261,25 @@ def extract_contract_address(text: str) -> str | None:
             return candidate
 
     return None
+
+
+def has_question_with_ca(text: str) -> bool:
+    """
+    Return True if the text contains BOTH a contract address AND
+    meaningful question/request text (not just a bare CA).
+    E.g. 'TA on this please: 0xabc...' → True
+         '0xabc...' → False (bare CA, no question)
+    """
+    ca = extract_contract_address(text)
+    if not ca:
+        return False
+    # Remove the CA from the text and see if anything meaningful remains
+    remaining = text.replace(ca, '').strip()
+    # Strip common punctuation/colons left behind
+    remaining = re.sub(r'^[:\s,;-]+|[:\s,;-]+$', '', remaining).strip()
+    # Need at least 2 words of actual question/request text
+    words = [w for w in remaining.split() if len(w) > 1]
+    return len(words) >= 2
 
 
 async def fetch_dexscreener_data(chain: str, pair_address: str) -> dict | None:
@@ -702,7 +721,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Detect live-data requests (skip cache for these) ──
     has_dex_url = bool(extract_dexscreener_urls(user_text))
-    raw_ca = extract_contract_address(user_text)
+    raw_ca = extract_contract_address(user_text) if has_question_with_ca(user_text) else None
     has_raw_ca = bool(raw_ca)
     tv_symbol = extract_symbol(user_text)
     has_live_data = has_dex_url or has_raw_ca or (tv_symbol and is_ta_request(user_text))
@@ -817,15 +836,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Query AI with multi-provider fallback ──
     live_context = dex_context + tv_context
 
-    # When user just pastes a raw CA, enrich the prompt so the AI knows
-    # they want token analysis (not just "what is this address?")
-    effective_text = user_text
-    if raw_ca and dex_context and "LIVE TOKEN DATA" in dex_context:
-        effective_text = (f"{user_text}\n\n"
-                         f"[The user pasted a contract address. "
-                         f"Analyze the live token data below as a token analysis request.]")
-
-    prompt = f"[Group member {user_name} asks]: {effective_text}{live_context}"
+    prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
 
     try:
         # Chart responses must fit in 1024-char Telegram caption → fewer tokens.
