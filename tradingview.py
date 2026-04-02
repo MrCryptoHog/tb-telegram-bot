@@ -282,8 +282,15 @@ _INTERVAL_LABELS = {
 }
 
 
-def format_tradingview_context(tv_symbol: TVSymbol, interval: str, data: dict) -> str:
-    """Format TradingView TA data into a readable block for the AI prompt."""
+def format_tradingview_context(
+    tv_symbol: TVSymbol, interval: str, data: dict,
+    chart_price: str | None = None,
+) -> str:
+    """Format TradingView TA data into a readable block for the AI prompt.
+
+    If chart_price is provided (scraped from the live chart widget), it
+    overrides the scanning API's close price so the text matches the chart.
+    """
     ind = data["indicators"]
     summary = data["summary"]
     osc = data["oscillators"]
@@ -313,7 +320,7 @@ def format_tradingview_context(tv_symbol: TVSymbol, interval: str, data: dict) -
         f"Open: {fmt(ind.get('open'), price_dp)}",
         f"High: {fmt(ind.get('high'), price_dp)}",
         f"Low: {fmt(ind.get('low'), price_dp)}",
-        f"Close: {fmt(ind.get('close'), price_dp)}",
+        f"Close (live): {chart_price if chart_price else fmt(ind.get('close'), price_dp)}",
         f"Change: {fmt(ind.get('change'))}%",
         f"",
         f"=== OVERALL RECOMMENDATION ===",

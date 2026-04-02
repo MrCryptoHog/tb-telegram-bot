@@ -56,14 +56,15 @@ async def screenshot_tradingview_chart(
     interval: str = "1h",
     width: int = 1280,
     height: int = 800,
-) -> Optional[bytes]:
+) -> tuple[bytes | None, str | None]:
     """
     Screenshot a TradingView chart via their widget embed page.
 
     The chart renders in dark theme with RSI, MACD, and Bollinger Band
     overlays — the same indicators the AI analyses in text.
 
-    Returns PNG bytes on success, None on failure.
+    Returns (PNG bytes, live_price_string) on success.
+    Either or both may be None on failure.
     """
     page = None
     try:
@@ -100,15 +101,56 @@ async def screenshot_tradingview_chart(
         # Extra time for candlestick data to stream in via WebSocket
         await page.wait_for_timeout(3_000)
 
+        # ---- Extract the live price shown on the chart ----
+        chart_price = None
+        try:
+            # The widget header shows "C<price>" for the close of the current
+            # bar being hovered / the last bar.  Try multiple selectors.
+            price_text = await page.evaluate("""
+                () => {
+                    // Method 1: OHLC header values (the "C" value = current close)
+                    const spans = document.querySelectorAll(
+                        '[class*="headerWrapper"] [class*="value"]'
+                    );
+                    if (spans.length >= 4) {
+                        // spans are O, H, L, C in order
+                        return spans[3]?.textContent?.trim() || null;
+                    }
+                    // Method 2: last price label on the price axis
+                    const priceLine = document.querySelector(
+                        '[class*="lastPrice"], [class*="currentPrice"], '
+                        + '[class*="price-axis"] [class*="last"]'
+                    );
+                    if (priceLine) return priceLine.textContent?.trim() || null;
+                    // Method 3: try to find any element containing
+                    // the close price text in the header row
+                    const header = document.querySelector('[class*="headerWrapper"]');
+                    if (header) {
+                        const all = header.querySelectorAll('div, span');
+                        for (const el of all) {
+                            const t = el.textContent?.trim();
+                            if (t && /^\d[\d,]*\.\d+$/.test(t)) return t;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if price_text:
+                # Remove commas: "67,100.50" → "67100.50"
+                chart_price = price_text.replace(",", "").strip()
+                logger.info("Chart live price extracted: %s", chart_price)
+        except Exception as price_exc:
+            logger.warning("Could not extract chart price: %s", price_exc)
+
         screenshot = await page.screenshot(type="png")
         await page.close()
         page = None
 
         logger.info(
-            "TradingView chart captured: %s:%s (%s) — %d bytes",
-            widget_exchange, symbol, interval, len(screenshot),
+            "TradingView chart captured: %s:%s (%s) — %d bytes, price=%s",
+            widget_exchange, symbol, interval, len(screenshot), chart_price,
         )
-        return screenshot
+        return screenshot, chart_price
 
     except Exception as exc:
         logger.error("TradingView screenshot failed (%s:%s): %s", exchange, symbol, exc)
@@ -117,7 +159,7 @@ async def screenshot_tradingview_chart(
                 await page.close()
             except Exception:
                 pass
-        return None
+        return None, None
 
 
 # ── DexScreener chart screenshot ────────────────────────────────────────────

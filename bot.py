@@ -681,17 +681,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           "Acknowledge the link and offer general guidance.]")
             logger.warning("DexScreener returned no data for %s/%s", chain, pair_addr)
 
-    # ── Check for TradingView TA request → fetch live indicators ──
+    # ── Check for TradingView TA request → fetch live indicators + chart ──
     tv_context = ""
     interval = None
+    chart_image = None       # will hold PNG bytes if we capture a chart
+    chart_price = None       # live price scraped from the chart widget
     if tv_symbol and is_ta_request(user_text):
         interval = extract_interval(user_text)
         logger.info("TradingView TA request: %s (%s)", tv_symbol.display_name, interval)
-        tv_data = fetch_tradingview_ta(tv_symbol, interval)
+
+        # Fetch indicators + chart screenshot in parallel.
+        # We need the chart_price BEFORE building the AI prompt,
+        # so the screenshot must finish before the AI call starts.
+        import asyncio as _aio
+        tv_data_result, chart_result = await _aio.gather(
+            _aio.get_event_loop().run_in_executor(
+                None, fetch_tradingview_ta, tv_symbol, interval
+            ),
+            screenshot_tradingview_chart(
+                tv_symbol.symbol, tv_symbol.exchange, interval
+            ),
+            return_exceptions=True,
+        )
+
+        # Unpack TA data
+        tv_data = tv_data_result if not isinstance(tv_data_result, Exception) else None
+        if isinstance(tv_data_result, Exception):
+            logger.warning("TradingView TA fetch error: %s", tv_data_result)
+
+        # Unpack chart screenshot + price
+        if isinstance(chart_result, Exception):
+            logger.warning("Chart screenshot error: %s", chart_result)
+        else:
+            chart_image, chart_price = chart_result
+
         if tv_data:
-            tv_context = "\n\n" + format_tradingview_context(tv_symbol, interval, tv_data)
-            logger.info("TradingView data fetched for %s (%d bytes)",
-                       tv_symbol.display_name, len(tv_context))
+            tv_context = "\n\n" + format_tradingview_context(
+                tv_symbol, interval, tv_data, chart_price=chart_price
+            )
+            logger.info("TradingView data fetched for %s (%d bytes, chart_price=%s)",
+                       tv_symbol.display_name, len(tv_context), chart_price)
         else:
             tv_context = (f"\n\n[Note: User asked for TA on {tv_symbol.display_name} "
                          f"but TradingView returned no data. Acknowledge the request "
@@ -710,34 +739,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         tokens = 500 if has_chart else (1200 if live_context else 800)
 
-        # ── Determine if we should capture a chart screenshot ──
-        screenshot_coro = None
-        if tv_symbol and is_ta_request(user_text) and interval:
-            screenshot_coro = screenshot_tradingview_chart(
-                tv_symbol.symbol, tv_symbol.exchange, interval
-            )
-        elif has_dex_url and chain and pair_addr:
-            screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
+        # ── Determine if we should capture a DexScreener screenshot ──
+        # (TradingView screenshots are already captured above with the TA data)
+        dex_screenshot_coro = None
+        if has_dex_url and chain and pair_addr and not chart_image:
+            dex_screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
 
-        # ── Run AI call (+ screenshot in parallel if applicable) ──
-        chart_image = None
-        if screenshot_coro:
+        # ── Run AI call (+ DexScreener screenshot in parallel if applicable) ──
+        if dex_screenshot_coro:
             results = await asyncio.gather(
                 provider_mgr.generate(
                     system_prompt=SYSTEM_PROMPT,
                     user_message=prompt,
                     max_tokens=tokens,
                 ),
-                screenshot_coro,
+                dex_screenshot_coro,
                 return_exceptions=True,
             )
             # Unpack AI result (must succeed)
             if isinstance(results[0], Exception):
                 raise results[0]
             answer, provider_name = results[0]
-            # Unpack screenshot (graceful — None on failure)
+            # Unpack DexScreener screenshot (graceful — None on failure)
             if isinstance(results[1], Exception):
-                logger.warning("Chart screenshot failed: %s", results[1])
+                logger.warning("DexScreener screenshot failed: %s", results[1])
             else:
                 chart_image = results[1]
         else:
