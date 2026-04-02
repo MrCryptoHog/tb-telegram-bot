@@ -34,7 +34,7 @@ from telegram.ext import (
 
 from providers import ProviderManager
 from rate_limiter import RateLimiter
-from charts import screenshot_tradingview_chart, screenshot_dexscreener_chart
+from charts import screenshot_tradingview_chart, screenshot_geckoterminal_chart
 from tradingview import (
     extract_symbol,
     extract_interval,
@@ -856,9 +856,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         has_chart = has_tv_chart or (has_dex_chart and not chart_image)
         tokens = 500 if has_chart else (1200 if live_context else 800)
 
-        # ── DexScreener screenshot + AI call in parallel ──
+        # ── GeckoTerminal chart screenshot + AI call in parallel ──
         if has_dex_chart and not chart_image:
-            dex_screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
+            dex_screenshot_coro = screenshot_geckoterminal_chart(chain, pair_addr)
             results = await asyncio.gather(
                 provider_mgr.generate(
                     system_prompt=SYSTEM_PROMPT,
@@ -872,7 +872,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise results[0]
             answer, provider_name = results[0]
             if isinstance(results[1], Exception):
-                logger.warning("DexScreener screenshot failed: %s", results[1])
+                logger.warning("GeckoTerminal screenshot failed: %s", results[1])
             else:
                 chart_image = results[1]
         else:

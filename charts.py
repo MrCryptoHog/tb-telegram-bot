@@ -1,7 +1,7 @@
 """
 Chart screenshot module using Playwright (headless Chromium).
 
-Captures TradingView widget embeds and DexScreener chart pages as PNG images
+Captures TradingView widget embeds and GeckoTerminal chart embeds as PNG images
 and returns the raw bytes for sending via Telegram's send_photo API.
 
 Browser instance is shared (singleton) and lazily launched on first use.
@@ -162,16 +162,45 @@ async def screenshot_tradingview_chart(
         return None, None
 
 
-# ── DexScreener chart screenshot ────────────────────────────────────────────
+# ── GeckoTerminal chart screenshot (replaces DexScreener — Cloudflare blocked) ─
 
-async def screenshot_dexscreener_chart(
+# Map DexScreener chainId → GeckoTerminal network slug
+_GT_CHAIN_MAP = {
+    "ethereum": "eth",
+    "bsc": "bsc",
+    "solana": "solana",
+    "arbitrum": "arbitrum",
+    "polygon": "polygon_pos",
+    "base": "base",
+    "avalanche": "avax",
+    "optimism": "optimism",
+    "fantom": "ftm",
+    "cronos": "cronos",
+    "pulsechain": "pulsechain",
+    "blast": "blast",
+    "mantle": "mantle",
+    "linea": "linea",
+    "zksync": "zksync",
+    "scroll": "scroll",
+    "celo": "celo",
+    "sui": "sui-network",
+    "aptos": "aptos",
+    "ton": "ton",
+    "tron": "tron",
+}
+
+
+async def screenshot_geckoterminal_chart(
     chain: str,
     pair_address: str,
     width: int = 1280,
     height: int = 900,
 ) -> Optional[bytes]:
     """
-    Screenshot the DexScreener chart page for a token pair.
+    Screenshot the GeckoTerminal embed chart for a token pair.
+
+    Uses GeckoTerminal's embed page which does NOT have Cloudflare blocking,
+    unlike DexScreener's main site which returns 403 to headless browsers.
 
     Returns PNG bytes on success, None on failure.
     """
@@ -180,39 +209,38 @@ async def screenshot_dexscreener_chart(
         browser = await _get_browser()
         page = await browser.new_page(viewport={"width": width, "height": height})
 
-        url = f"https://dexscreener.com/{chain}/{pair_address}"
-        # Use "load" instead of "networkidle" — DexScreener's WebSocket
-        # streams keep the network busy indefinitely, causing networkidle
-        # to always timeout.  "load" fires once the page + resources load,
-        # then we give the chart JS a few seconds to render.
-        await page.goto(url, wait_until="load", timeout=15_000)
+        # Map DexScreener chain ID to GeckoTerminal network slug
+        gt_chain = _GT_CHAIN_MAP.get(chain, chain)
 
-        # Dismiss cookie / permission banners
-        for btn_text in ["Accept", "Got it", "Close", "OK", "I understand"]:
-            try:
-                await page.click(f'button:has-text("{btn_text}")', timeout=1_000)
-            except Exception:
-                pass
+        url = (
+            f"https://www.geckoterminal.com/{gt_chain}/pools/{pair_address}"
+            f"?embed=1&info=0&swaps=0"
+        )
+        logger.info("GeckoTerminal chart URL: %s", url)
 
-        # Wait for the chart canvas to appear, then extra render time
+        await page.goto(url, wait_until="load", timeout=20_000)
+
+        # Wait for chart canvas to render
         try:
-            await page.wait_for_selector("canvas", timeout=8_000)
+            await page.wait_for_selector("canvas", timeout=12_000)
         except Exception:
-            logger.warning("DexScreener canvas not found, using timed wait")
-        await page.wait_for_timeout(3_000)
+            logger.warning("GeckoTerminal canvas not found, using timed wait")
+
+        # Give chart JS time to finish rendering candlesticks
+        await page.wait_for_timeout(4_000)
 
         screenshot = await page.screenshot(type="png")
         await page.close()
         page = None
 
         logger.info(
-            "DexScreener chart captured: %s/%s — %d bytes",
-            chain, pair_address, len(screenshot),
+            "GeckoTerminal chart captured: %s/%s — %d bytes",
+            gt_chain, pair_address, len(screenshot),
         )
         return screenshot
 
     except Exception as exc:
-        logger.error("DexScreener screenshot failed (%s/%s): %s", chain, pair_address, exc)
+        logger.error("GeckoTerminal screenshot failed (%s/%s): %s", chain, pair_address, exc)
         if page:
             try:
                 await page.close()
