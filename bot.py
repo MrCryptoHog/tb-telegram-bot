@@ -30,6 +30,7 @@ from telegram.ext import (
 )
 
 from providers import ProviderManager
+from rate_limiter import RateLimiter
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -54,6 +55,24 @@ logger = logging.getLogger("TB")
 # ── AI Provider Manager ─────────────────────────────────────────────────────
 
 provider_mgr = ProviderManager()
+
+# ── Rate limiter ─────────────────────────────────────────────────────────────
+# Math: 5 free-tier providers ≈ 8,700 safe API calls/day ≈ 362/hour.
+# With 30-min response cache (~30% savings) → ~12,400 effective/day ≈ 517/hr.
+# 2-hour window ≈ 1,034 available calls. We cap well below that for safety.
+#
+#   Per-user:  8 questions per 2-hour window
+#   Anti-spam: 45-second minimum gap between questions
+#   Global:    150 API calls per 2-hour window (keeps us at ~1,800/day max)
+#   → At 1,800/day, we only use ~21% of the 8,700 daily budget
+#   → Even if one provider dies, the remaining 4 can cover it easily
+
+rate_limiter = RateLimiter(
+    user_max_per_window=8,
+    window_seconds=7200,       # 2 hours
+    user_cooldown_seconds=45,  # min gap between messages
+    global_max_per_window=150, # group-wide cap per 2h
+)
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
@@ -253,14 +272,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    user_id = update.effective_user.id
     user_name = update.effective_user.first_name or "trader"
-    logger.info("Question from %s: %s", user_name, user_text[:120])
+    logger.info("Question from %s (id=%s): %s", user_name, user_id, user_text[:120])
 
-    # ── Check cache first (saves rate limits!) ──
+    # ── Check cache first (costs zero rate limit!) ──
     cached = response_cache.get(user_text)
     if cached:
-        logger.info("Cache hit — serving cached response")
+        logger.info("Cache hit — serving cached response (no rate limit used)")
         await _send_reply(update, cached)
+        return
+
+    # ── Rate limit check (only for non-cached / actual API calls) ──
+    allowed, denial_msg = rate_limiter.check(user_id, user_name)
+    if not allowed:
+        logger.info("Rate-limited %s (id=%s): %s", user_name, user_id, denial_msg)
+        await update.effective_message.reply_text(denial_msg)
         return
 
     # ── Show typing indicator ──
@@ -279,6 +306,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         logger.info("Response from %s (%d chars)", provider_name, len(answer))
+
+        # Record successful API call for rate limiting
+        rate_limiter.record(user_id)
 
         # Append psychology footer if needed
         if mentions_psychology(user_text) and "/psychology" not in answer:
