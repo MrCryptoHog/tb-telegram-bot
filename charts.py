@@ -217,13 +217,13 @@ async def screenshot_geckoterminal_chart(
     """
     Screenshot the GeckoTerminal embed chart for a token pair.
 
-    Uses GeckoTerminal's embed page which does NOT have Cloudflare blocking,
-    unlike DexScreener's main site which returns 403 to headless browsers.
-
-    Parameters:
-        chain: DexScreener chain ID (e.g. "ethereum", "solana")
-        pair_address: The pair/pool contract address
-        interval: Timeframe string like "1h", "4h", "1d" etc.
+    The embed page loads a TradingView widget inside a child iframe.
+    We must:
+      1. Wait for the TradingView iframe to appear
+      2. Wait for its toolbar buttons to load (~8s from page load)
+      3. Click the correct timeframe button *inside the iframe*
+      4. Wait for candlestick data to render
+      5. Screenshot the full page
 
     Returns PNG bytes on success, None on failure.
     """
@@ -232,79 +232,98 @@ async def screenshot_geckoterminal_chart(
         browser = await _get_browser()
         page = await browser.new_page(viewport={"width": width, "height": height})
 
-        # Map DexScreener chain ID to GeckoTerminal network slug
         gt_chain = _GT_CHAIN_MAP.get(chain, chain)
-
         url = (
             f"https://www.geckoterminal.com/{gt_chain}/pools/{pair_address}"
             f"?embed=1&info=0&swaps=0"
         )
         logger.info("GeckoTerminal chart URL: %s (interval=%s)", url, interval)
 
-        # Load the page — use domcontentloaded (faster) since the chart
-        # data streams in via JS/WebSocket after initial load anyway.
         await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
 
-        # ── Click the correct timeframe button ──
-        tf_btn = _GT_TIMEFRAME_BUTTONS.get(interval, "1h")
-        try:
-            # The timeframe buttons are in the top toolbar: 1s 1m 5m 15m 1h 4h D
-            btn = page.locator(f'button:text-is("{tf_btn}")').first
-            await btn.wait_for(state="visible", timeout=10_000)
-            await btn.click()
-            logger.info("Clicked timeframe button: %s", tf_btn)
-            # Wait for chart to re-render with new timeframe data
-            await page.wait_for_timeout(2_000)
-        except Exception as tf_exc:
-            logger.warning("Could not click timeframe %s: %s", tf_btn, tf_exc)
+        # ── 1. Find the TradingView iframe by name ──
+        tv_frame = None
+        for _ in range(15):
+            await page.wait_for_timeout(1_000)
+            for f in page.frames:
+                if "tradingview" in f.name.lower():
+                    tv_frame = f
+                    break
+            if tv_frame:
+                break
 
-        # ── Wait for chart to fully render with candlestick data ──
-        # Strategy: wait for multiple canvases (TradingView creates several)
-        # then poll until pixel data shows the chart is drawn (not blank).
-        try:
-            await page.wait_for_selector("canvas", timeout=15_000)
-        except Exception:
-            logger.warning("GeckoTerminal canvas not found")
+        if not tv_frame:
+            logger.warning("TradingView iframe not found, taking plain screenshot")
+            await page.wait_for_timeout(5_000)
+            screenshot = await page.screenshot(type="png")
+            await page.close()
+            return screenshot
 
-        # Poll: check if chart canvases have non-blank content by
-        # sampling pixel data from the main chart canvas.
-        for attempt in range(20):          # up to ~10 seconds
-            has_content = await page.evaluate("""
-                () => {
-                    const canvases = document.querySelectorAll('canvas');
-                    for (const c of canvases) {
-                        if (c.width < 100 || c.height < 100) continue;
-                        try {
-                            const ctx = c.getContext('2d');
-                            if (!ctx) continue;
-                            // Sample pixels from the chart area (middle region)
-                            const w = c.width, h = c.height;
-                            const data = ctx.getImageData(
-                                Math.floor(w * 0.2), Math.floor(h * 0.2),
-                                Math.floor(w * 0.6), Math.floor(h * 0.4)
-                            ).data;
-                            // Count non-background pixels (not pure dark)
-                            let colored = 0;
-                            for (let i = 0; i < data.length; i += 16) {
-                                const r = data[i], g = data[i+1], b = data[i+2];
-                                // GeckoTerminal dark theme background is ~(19,23,34)
-                                if (r > 30 || g > 35 || b > 45) colored++;
-                            }
-                            if (colored > 50) return true;
-                        } catch(e) {}
+        logger.info("TradingView iframe found: %s", tv_frame.name)
+
+        # ── 2. Wait for toolbar buttons to load inside the iframe ──
+        tf_btn_text = _GT_TIMEFRAME_BUTTONS.get(interval, "1h")
+        btn_ready = False
+        for _ in range(12):
+            await page.wait_for_timeout(1_000)
+            has_btn = await tv_frame.evaluate("""
+                (target) => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent?.trim() === target) return true;
                     }
                     return false;
                 }
-            """)
-            if has_content:
-                logger.info("GeckoTerminal chart content detected (attempt %d)", attempt + 1)
+            """, tf_btn_text)
+            if has_btn:
+                btn_ready = True
                 break
-            await page.wait_for_timeout(500)
-        else:
-            logger.warning("GeckoTerminal chart may be blank, screenshotting anyway")
 
-        # Final settle for any remaining animation
-        await page.wait_for_timeout(1_500)
+        # ── 3. Click the timeframe button inside the iframe ──
+        if btn_ready:
+            clicked = await tv_frame.evaluate("""
+                (target) => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent?.trim() === target && b.offsetParent !== null) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """, tf_btn_text)
+            if clicked:
+                logger.info("Clicked timeframe button '%s' in TV iframe", tf_btn_text)
+            else:
+                logger.warning("Timeframe button '%s' found but click failed", tf_btn_text)
+        else:
+            logger.warning("Timeframe button '%s' never appeared in TV iframe", tf_btn_text)
+
+        # ── 4. Wait for chart data to render ──
+        # After clicking timeframe, new candles need to load.
+        # Poll until the iframe reports canvases with actual drawn content.
+        for attempt in range(15):
+            await page.wait_for_timeout(1_000)
+            canvas_count = await tv_frame.evaluate("""
+                () => {
+                    const canvases = document.querySelectorAll('canvas');
+                    let loaded = 0;
+                    for (const c of canvases) {
+                        if (c.width > 200 && c.height > 200) loaded++;
+                    }
+                    return loaded;
+                }
+            """)
+            if canvas_count >= 2:
+                logger.info("Chart rendered (%d large canvases at attempt %d)",
+                           canvas_count, attempt + 1)
+                break
+        else:
+            logger.warning("Chart may not be fully rendered, proceeding anyway")
+
+        # Final settle for rendering
+        await page.wait_for_timeout(2_000)
 
         screenshot = await page.screenshot(type="png")
         await page.close()
