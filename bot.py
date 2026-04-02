@@ -183,8 +183,12 @@ of the question. You MUST:\
 10. **TradingView Technical Analysis (IMPORTANT)** – When the message contains a \
 "=== LIVE TRADINGVIEW TECHNICAL ANALYSIS ===" block, you MUST provide a \
 detailed technical analysis using the real indicator data provided. This data \
-is fetched live from TradingView at the moment of the question. You MUST:\
-  • State the asset, timeframe, and current price right away\
+is fetched live from TradingView at the moment of the question. A live chart \
+image IS attached alongside your text reply — the user can see the candles. \
+The price in the data block is the canonical source of truth (the chart may \
+show a slightly different tick due to streaming delay — ignore that). \
+You MUST:\
+  • State the asset, timeframe, and current price (from the data block) right away\
   • Interpret the overall recommendation (BUY/SELL/NEUTRAL) and signal counts\
   • Analyze RSI: overbought (>70), oversold (<30), or neutral territory\
   • Analyze MACD: bullish/bearish crossover, histogram direction\
@@ -193,6 +197,8 @@ is fetched live from TradingView at the moment of the question. You MUST:\
   • Note ADX for trend strength (>25 = strong trend, <20 = ranging)\
   • Mention key pivot levels as support/resistance\
   • Summarize with 2-3 actionable takeaways\
+  Keep your response concise — the chart image provides the visual context, \
+  so focus your text on interpreting the numbers, not describing the chart.\
   NEVER say "I don't have access to live data" when this block is present.\
   This is a real-time snapshot, remind them to monitor for updates and DYOR.
 """
@@ -691,15 +697,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Determine if we should capture a chart screenshot ──
         screenshot_coro = None
-        chart_caption = ""
         if tv_symbol and is_ta_request(user_text) and interval:
             screenshot_coro = screenshot_tradingview_chart(
                 tv_symbol.symbol, tv_symbol.exchange, interval
             )
-            chart_caption = f"📊 {tv_symbol.display_name} — {interval}"
         elif has_dex_url and chain and pair_addr:
             screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
-            chart_caption = "📊 DexScreener Chart"
 
         # ── Run AI call (+ screenshot in parallel if applicable) ──
         chart_image = None
@@ -744,21 +747,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Cache the sanitized response
         response_cache.put(user_text, answer)
 
-        # ── Send chart image first (if captured) ──
+        # ── Send response (with chart image if captured) ──
         if chart_image:
-            try:
-                photo = BytesIO(chart_image)
-                photo.name = "chart.png"
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=photo,
-                    caption=chart_caption,
-                    reply_to_message_id=update.effective_message.message_id,
-                )
-            except Exception as photo_exc:
-                logger.warning("Failed to send chart photo: %s", photo_exc)
-
-        await _send_reply(update, answer)
+            await _send_reply(update, answer, chart_image=chart_image)
+        else:
+            await _send_reply(update, answer)
 
     except Exception as exc:
         logger.exception("All providers failed: %s", exc)
@@ -767,8 +760,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def _send_reply(update: Update, answer: str):
-    """Send the answer, splitting if needed, with HTML fallback to plain text."""
+async def _send_reply(
+    update: Update,
+    answer: str,
+    chart_image: bytes | None = None,
+):
+    """
+    Send the answer, optionally combined with a chart image.
+
+    Telegram photo captions are limited to 1024 chars.  Strategy:
+      1. If chart_image is provided AND text ≤ 1024 chars → single photo message
+         with the full text as caption.
+      2. If chart_image provided but text > 1024 → photo with first 1024-char
+         portion as caption, then remainder as follow-up text message(s).
+      3. No chart_image → plain text message(s), split at 4096 chars.
+    """
+    CAPTION_LIMIT = 1024
+
+    if chart_image:
+        photo = BytesIO(chart_image)
+        photo.name = "chart.png"
+
+        if len(answer) <= CAPTION_LIMIT:
+            # Everything fits in one message
+            try:
+                await update.effective_message.reply_photo(
+                    photo=photo, caption=answer, parse_mode="HTML",
+                )
+            except Exception:
+                clean = re.sub(r'<[^>]+>', '', answer)
+                photo.seek(0)
+                try:
+                    await update.effective_message.reply_photo(
+                        photo=photo, caption=clean,
+                    )
+                except Exception as exc:
+                    logger.warning("Photo send failed entirely: %s", exc)
+                    await update.effective_message.reply_text(clean)
+            return
+        else:
+            # Caption overflow: send photo with truncated caption,
+            # then remaining text as follow-up message(s)
+            caption_text = answer[:CAPTION_LIMIT]
+            overflow_text = answer[CAPTION_LIMIT:]
+
+            # Try to break at last newline to avoid mid-sentence cut
+            brk = caption_text.rfind("\n", 0, CAPTION_LIMIT)
+            if brk > CAPTION_LIMIT // 2:
+                overflow_text = answer[brk:].lstrip("\n")
+                caption_text = answer[:brk]
+
+            try:
+                await update.effective_message.reply_photo(
+                    photo=photo, caption=caption_text, parse_mode="HTML",
+                )
+            except Exception:
+                clean_cap = re.sub(r'<[^>]+>', '', caption_text)
+                photo.seek(0)
+                try:
+                    await update.effective_message.reply_photo(
+                        photo=photo, caption=clean_cap,
+                    )
+                except Exception as exc:
+                    logger.warning("Photo send failed: %s", exc)
+                    # Fall through to send everything as text
+                    overflow_text = answer
+
+            # Send remaining text as follow-up
+            if overflow_text.strip():
+                chunks = smart_split(overflow_text, 4096)
+                for chunk in chunks:
+                    try:
+                        await update.effective_message.reply_text(
+                            chunk, parse_mode="HTML",
+                        )
+                    except Exception:
+                        clean = re.sub(r'<[^>]+>', '', chunk)
+                        await update.effective_message.reply_text(clean)
+            return
+
+    # No chart image — plain text
     chunks = smart_split(answer, 4096)
     for chunk in chunks:
         try:
