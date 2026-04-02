@@ -851,18 +851,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
 
     try:
-        # For DexScreener CAs, the chart may take a while to screenshot.
-        # Don't let that block the text response — send text first, chart after.
         has_tv_chart = bool(tv_symbol and is_ta_request(user_text) and interval)
         has_dex_chart = bool((has_dex_url or has_raw_ca) and chain and pair_addr)
-        tokens = 500 if (has_tv_chart and chart_image) else (1200 if live_context else 800)
+        has_chart = has_tv_chart or (has_dex_chart and not chart_image)
+        tokens = 500 if has_chart else (1200 if live_context else 800)
 
-        # ── Get AI response ──
-        answer, provider_name = await provider_mgr.generate(
-            system_prompt=SYSTEM_PROMPT,
-            user_message=prompt,
-            max_tokens=tokens,
-        )
+        # ── DexScreener screenshot + AI call in parallel ──
+        if has_dex_chart and not chart_image:
+            dex_screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
+            results = await asyncio.gather(
+                provider_mgr.generate(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_message=prompt,
+                    max_tokens=tokens,
+                ),
+                dex_screenshot_coro,
+                return_exceptions=True,
+            )
+            if isinstance(results[0], Exception):
+                raise results[0]
+            answer, provider_name = results[0]
+            if isinstance(results[1], Exception):
+                logger.warning("DexScreener screenshot failed: %s", results[1])
+            else:
+                chart_image = results[1]
+        else:
+            answer, provider_name = await provider_mgr.generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_message=prompt,
+                max_tokens=tokens,
+            )
 
         logger.info("Response from %s (%d chars)", provider_name, len(answer))
 
@@ -880,30 +898,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not has_live_data:
             response_cache.put(user_text, answer)
 
-        # ── Send response ──
+        # ── Send response (chart + text combined if available) ──
         if chart_image:
-            # TradingView chart already captured above — send together
             await _send_reply(update, answer, chart_image=chart_image, context=context)
         else:
-            # Send text immediately (don't wait for DexScreener screenshot)
             await _send_reply(update, answer, context=context)
-
-            # Now try DexScreener screenshot separately (non-blocking for user)
-            if has_dex_chart and not chart_image:
-                try:
-                    dex_img = await screenshot_dexscreener_chart(chain, pair_addr)
-                    if dex_img:
-                        from io import BytesIO as _BytesIO
-                        photo = _BytesIO(dex_img)
-                        photo.name = "chart.png"
-                        bot = context.bot if context else update.get_bot()
-                        await bot.send_photo(
-                            chat_id=update.effective_chat.id,
-                            photo=photo,
-                        )
-                        logger.info("DexScreener chart sent as follow-up")
-                except Exception as chart_exc:
-                    logger.warning("DexScreener chart follow-up failed: %s", chart_exc)
 
     except Exception as exc:
         logger.exception("All providers failed: %s", exc)
