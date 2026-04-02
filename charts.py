@@ -1,15 +1,21 @@
 """
-Chart screenshot module using Playwright (headless Chromium).
+Chart module — generates candlestick chart images.
 
-Captures TradingView widget embeds and GeckoTerminal chart embeds as PNG images
-and returns the raw bytes for sending via Telegram's send_photo API.
+TradingView charts: Playwright screenshots of widget embeds (works great).
+DEX token charts:   Generated via mplfinance from GeckoTerminal OHLCV API
+                    data (Playwright screenshots of GT embeds fail because
+                    the TradingView widget inside them doesn't render candle
+                    data in headless Chromium).
 
 Browser instance is shared (singleton) and lazily launched on first use.
 """
 
 import asyncio
 import logging
+from io import BytesIO
 from typing import Optional
+
+import httpx
 
 logger = logging.getLogger("TB.charts")
 
@@ -162,7 +168,9 @@ async def screenshot_tradingview_chart(
         return None, None
 
 
-# ── GeckoTerminal chart screenshot (replaces DexScreener — Cloudflare blocked) ─
+# ── DEX token chart via GeckoTerminal OHLCV API + mplfinance ─────────────────
+# No browser needed — fetches candle data from the free GT API and renders
+# a professional-looking candlestick chart with volume using matplotlib.
 
 # Map DexScreener chainId → GeckoTerminal network slug
 _GT_CHAIN_MAP = {
@@ -189,159 +197,132 @@ _GT_CHAIN_MAP = {
     "tron": "tron",
 }
 
-
-# ── GeckoTerminal timeframe button map ──
-# Maps common interval strings to the button text visible in
-# the GeckoTerminal TradingView embed toolbar.
-_GT_TIMEFRAME_BUTTONS = {
-    "1m": "1m",
-    "5m": "5m",
-    "15m": "15m",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "D",
-    "1D": "D",
-    "1w": "D",     # GT embed doesn't have weekly — use daily
-    "1W": "D",
-    "1M": "D",
+# Map interval strings → GeckoTerminal OHLCV API parameters (timeframe, aggregate)
+_GT_OHLCV_PARAMS = {
+    "1m":  ("minute", 1),
+    "5m":  ("minute", 5),
+    "15m": ("minute", 15),
+    "30m": ("minute", 30),
+    "1h":  ("hour", 1),
+    "2h":  ("hour", 2),
+    "4h":  ("hour", 4),
+    "1d":  ("day", 1),
+    "1D":  ("day", 1),
+    "1w":  ("day", 1),   # GT has no weekly — show daily
+    "1W":  ("day", 1),
+    "1M":  ("day", 1),
 }
 
 
-async def screenshot_geckoterminal_chart(
+async def generate_dex_chart(
     chain: str,
     pair_address: str,
     interval: str = "1h",
-    width: int = 1280,
-    height: int = 900,
+    token_symbol: str = "TOKEN",
 ) -> Optional[bytes]:
     """
-    Screenshot the GeckoTerminal embed chart for a token pair.
+    Generate a candlestick + volume chart image for a DEX token pair.
 
-    The embed page loads a TradingView widget inside a child iframe.
-    We must:
-      1. Wait for the TradingView iframe to appear
-      2. Wait for its toolbar buttons to load (~8s from page load)
-      3. Click the correct timeframe button *inside the iframe*
-      4. Wait for candlestick data to render
-      5. Screenshot the full page
+    Fetches OHLCV data from GeckoTerminal's free API, then renders
+    a dark-themed candlestick chart using mplfinance.
 
     Returns PNG bytes on success, None on failure.
     """
-    page = None
     try:
-        browser = await _get_browser()
-        page = await browser.new_page(viewport={"width": width, "height": height})
-
+        # ── 1. Fetch OHLCV candles from GeckoTerminal API ──
         gt_chain = _GT_CHAIN_MAP.get(chain, chain)
-        url = (
-            f"https://www.geckoterminal.com/{gt_chain}/pools/{pair_address}"
-            f"?embed=1&info=0&swaps=0"
+        timeframe, aggregate = _GT_OHLCV_PARAMS.get(interval, ("hour", 1))
+
+        api_url = (
+            f"https://api.geckoterminal.com/api/v2/networks/{gt_chain}"
+            f"/pools/{pair_address}/ohlcv/{timeframe}"
+            f"?aggregate={aggregate}&limit=80"
         )
-        logger.info("GeckoTerminal chart URL: %s (interval=%s)", url, interval)
+        logger.info("Fetching OHLCV: %s", api_url)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(api_url)
+            resp.raise_for_status()
+            data = resp.json()
 
-        # ── 1. Find the TradingView iframe by name ──
-        tv_frame = None
-        for _ in range(15):
-            await page.wait_for_timeout(1_000)
-            for f in page.frames:
-                if "tradingview" in f.name.lower():
-                    tv_frame = f
-                    break
-            if tv_frame:
-                break
+        ohlcv_list = (
+            data.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+        )
+        if not ohlcv_list or len(ohlcv_list) < 3:
+            logger.warning("Not enough OHLCV data (%d candles)", len(ohlcv_list))
+            return None
 
-        if not tv_frame:
-            logger.warning("TradingView iframe not found, taking plain screenshot")
-            await page.wait_for_timeout(5_000)
-            screenshot = await page.screenshot(type="png")
-            await page.close()
-            return screenshot
+        # ── 2. Convert to pandas DataFrame ──
+        import pandas as pd
 
-        logger.info("TradingView iframe found: %s", tv_frame.name)
+        # Each candle: [timestamp, open, high, low, close, volume]
+        # API returns newest-first — reverse to chronological order
+        ohlcv_list.sort(key=lambda c: c[0])
 
-        # ── 2. Wait for toolbar buttons to load inside the iframe ──
-        tf_btn_text = _GT_TIMEFRAME_BUTTONS.get(interval, "1h")
-        btn_ready = False
-        for _ in range(12):
-            await page.wait_for_timeout(1_000)
-            has_btn = await tv_frame.evaluate("""
-                (target) => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        if (b.textContent?.trim() === target) return true;
-                    }
-                    return false;
-                }
-            """, tf_btn_text)
-            if has_btn:
-                btn_ready = True
-                break
+        df = pd.DataFrame(ohlcv_list, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+        df["Date"] = pd.to_datetime(df["timestamp"], unit="s")
+        df.set_index("Date", inplace=True)
+        df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
 
-        # ── 3. Click the timeframe button inside the iframe ──
-        if btn_ready:
-            clicked = await tv_frame.evaluate("""
-                (target) => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        if (b.textContent?.trim() === target && b.offsetParent !== null) {
-                            b.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-            """, tf_btn_text)
-            if clicked:
-                logger.info("Clicked timeframe button '%s' in TV iframe", tf_btn_text)
-            else:
-                logger.warning("Timeframe button '%s' found but click failed", tf_btn_text)
-        else:
-            logger.warning("Timeframe button '%s' never appeared in TV iframe", tf_btn_text)
+        # ── 3. Render chart with mplfinance ──
+        import mplfinance as mpf
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend
 
-        # ── 4. Wait for chart data to render ──
-        # After clicking timeframe, new candles need to load.
-        # Poll until the iframe reports canvases with actual drawn content.
-        for attempt in range(15):
-            await page.wait_for_timeout(1_000)
-            canvas_count = await tv_frame.evaluate("""
-                () => {
-                    const canvases = document.querySelectorAll('canvas');
-                    let loaded = 0;
-                    for (const c of canvases) {
-                        if (c.width > 200 && c.height > 200) loaded++;
-                    }
-                    return loaded;
-                }
-            """)
-            if canvas_count >= 2:
-                logger.info("Chart rendered (%d large canvases at attempt %d)",
-                           canvas_count, attempt + 1)
-                break
-        else:
-            logger.warning("Chart may not be fully rendered, proceeding anyway")
+        # Dark theme matching typical trading terminals
+        mc = mpf.make_marketcolors(
+            up="#26a69a", down="#ef5350",        # green / red candles
+            edge="inherit",
+            wick="inherit",
+            volume={"up": "#26a69a", "down": "#ef5350"},
+        )
+        style = mpf.make_mpf_style(
+            base_mpf_style="nightclouds",
+            marketcolors=mc,
+            facecolor="#131722",
+            edgecolor="#131722",
+            figcolor="#131722",
+            gridcolor="#1e222d",
+            gridstyle="--",
+            gridaxis="both",
+            y_on_right=True,
+            rc={
+                "font.size": 9,
+                "axes.labelcolor": "#787b86",
+                "xtick.color": "#787b86",
+                "ytick.color": "#787b86",
+            },
+        )
 
-        # Final settle for rendering
-        await page.wait_for_timeout(2_000)
+        # Build the title
+        tf_label = interval.upper() if len(interval) <= 3 else interval
+        title = f"{token_symbol}/USD · {tf_label}"
 
-        screenshot = await page.screenshot(type="png")
-        await page.close()
-        page = None
+        buf = BytesIO()
+        mpf.plot(
+            df,
+            type="candle",
+            style=style,
+            volume=True,
+            title=title,
+            ylabel="Price (USD)",
+            ylabel_lower="Volume",
+            figsize=(12, 7),
+            tight_layout=True,
+            savefig=dict(fname=buf, dpi=120, bbox_inches="tight", pad_inches=0.3),
+        )
+        buf.seek(0)
+        png_bytes = buf.read()
 
         logger.info(
-            "GeckoTerminal chart captured: %s/%s — %d bytes",
-            gt_chain, pair_address, len(screenshot),
+            "DEX chart generated: %s %s/%s (%s) — %d candles, %d bytes",
+            token_symbol, gt_chain, pair_address[:10], interval,
+            len(ohlcv_list), len(png_bytes),
         )
-        return screenshot
+        return png_bytes
 
     except Exception as exc:
-        logger.error("GeckoTerminal screenshot failed (%s/%s): %s", chain, pair_address, exc)
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
+        logger.error("DEX chart generation failed (%s/%s): %s", chain, pair_address, exc)
         return None
 
 

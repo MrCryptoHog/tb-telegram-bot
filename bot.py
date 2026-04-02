@@ -34,7 +34,7 @@ from telegram.ext import (
 
 from providers import ProviderManager
 from rate_limiter import RateLimiter
-from charts import screenshot_tradingview_chart, screenshot_geckoterminal_chart
+from charts import screenshot_tradingview_chart, generate_dex_chart
 from tradingview import (
     extract_symbol,
     extract_interval,
@@ -768,6 +768,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Check for DexScreener URLs OR raw contract addresses → fetch live data ──
     dex_context = ""
     chain = pair_addr = None
+    token_name = "TOKEN"
     dex_urls = extract_dexscreener_urls(user_text) if has_dex_url else []
     if dex_urls:
         chain, pair_addr = dex_urls[0]  # Use first URL found
@@ -856,12 +857,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         has_chart = has_tv_chart or (has_dex_chart and not chart_image)
         tokens = 500 if has_chart else (1200 if live_context else 800)
 
-        # ── GeckoTerminal chart screenshot + AI call in parallel ──
+        # ── DEX chart (mplfinance from GeckoTerminal API) + AI call in parallel ──
         if has_dex_chart and not chart_image:
             # Extract timeframe from user text for the chart (default 1h)
             dex_interval = extract_interval(user_text) if not interval else interval
-            dex_screenshot_coro = screenshot_geckoterminal_chart(
-                chain, pair_addr, interval=dex_interval
+            dex_token_sym = token_name
+            dex_chart_coro = generate_dex_chart(
+                chain, pair_addr, interval=dex_interval, token_symbol=dex_token_sym
             )
             results = await asyncio.gather(
                 provider_mgr.generate(
@@ -869,14 +871,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_message=prompt,
                     max_tokens=tokens,
                 ),
-                dex_screenshot_coro,
+                dex_chart_coro,
                 return_exceptions=True,
             )
             if isinstance(results[0], Exception):
                 raise results[0]
             answer, provider_name = results[0]
             if isinstance(results[1], Exception):
-                logger.warning("GeckoTerminal screenshot failed: %s", results[1])
+                logger.warning("DEX chart generation failed: %s", results[1])
             else:
                 chart_image = results[1]
         else:
