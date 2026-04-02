@@ -636,6 +636,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tv_symbol = extract_symbol(user_text)
     has_live_data = has_dex_url or (tv_symbol and is_ta_request(user_text))
 
+    if has_live_data:
+        logger.info("Live-data request detected — cache bypassed (dex=%s, tv=%s)",
+                     has_dex_url, tv_symbol.display_name if tv_symbol else None)
+
     # ── Check cache first (costs zero rate limit!) ──
     # Skip cache for live-data requests (DexScreener, TradingView)
     if not has_live_data:
@@ -755,8 +759,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Sanitize Markdown → HTML *before* caching so cache always stores clean HTML
         answer = sanitize_for_html(answer)
 
-        # Cache the sanitized response
-        response_cache.put(user_text, answer)
+        # Cache the sanitized response (skip for live-data — always fetch fresh)
+        if not has_live_data:
+            response_cache.put(user_text, answer)
 
         # ── Send response (with chart image if captured) ──
         if chart_image:
