@@ -696,6 +696,17 @@ def smart_split(text: str, limit: int = 4096) -> list[str]:
 
 # ── Core handler ─────────────────────────────────────────────────────────────
 
+async def _safe_reply_text(update: Update, text: str, **kwargs):
+    """Reply to a message, falling back to send_message if the original is gone."""
+    try:
+        await update.effective_message.reply_text(text, **kwargs)
+    except Exception:
+        try:
+            await update.effective_chat.send_message(text, **kwargs)
+        except Exception as exc:
+            logger.warning("Failed to send message: %s", exc)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process group messages that @mention the bot."""
     if not is_mention(update, BOT_USERNAME):
@@ -704,7 +715,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = strip_mention(update.effective_message.text, BOT_USERNAME)
 
     if not user_text:
-        await update.effective_message.reply_text(
+        await _safe_reply_text(
+            update,
             "Hey! Tag me with a question and I'll do my best to help. 💡"
         )
         return
@@ -716,7 +728,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Off-topic filter (zero API cost!) ──
     if not is_on_topic(user_text):
         logger.info("Off-topic from %s — rejected locally (0 API calls used)", user_name)
-        await update.effective_message.reply_text(OFF_TOPIC_REPLY, parse_mode="HTML")
+        await _safe_reply_text(update, OFF_TOPIC_REPLY, parse_mode="HTML")
         return
 
     # ── Detect live-data requests (skip cache for these) ──
@@ -744,7 +756,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed, denial_msg = rate_limiter.check(user_id, user_name)
     if not allowed:
         logger.info("Rate-limited %s (id=%s): %s", user_name, user_id, denial_msg)
-        await update.effective_message.reply_text(denial_msg)
+        await _safe_reply_text(update, denial_msg)
         return
 
     # ── Show typing indicator ──
@@ -903,7 +915,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as exc:
         logger.exception("All providers failed: %s", exc)
-        await update.effective_message.reply_text(
+        await _safe_reply_text(
+            update,
             "⚠️ I'm having a temporary issue. Please try again in a moment!"
         )
 
