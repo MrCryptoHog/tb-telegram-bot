@@ -130,6 +130,56 @@ _register(["wif", "wifusd", "wifusdt"],
 _register(["inj", "injective", "injusd", "injusdt"],
           "INJUSDT", "crypto", "BINANCE", "Injective (INJ/USDT)")
 
+# ── US Stocks ──
+_register(["aapl", "apple"],
+          "AAPL", "america", "NASDAQ", "Apple (AAPL)")
+_register(["msft", "microsoft"],
+          "MSFT", "america", "NASDAQ", "Microsoft (MSFT)")
+_register(["googl", "google", "goog", "alphabet"],
+          "GOOGL", "america", "NASDAQ", "Alphabet (GOOGL)")
+_register(["amzn", "amazon"],
+          "AMZN", "america", "NASDAQ", "Amazon (AMZN)")
+_register(["tsla", "tesla"],
+          "TSLA", "america", "NASDAQ", "Tesla (TSLA)")
+_register(["nvda", "nvidia"],
+          "NVDA", "america", "NASDAQ", "NVIDIA (NVDA)")
+_register(["meta", "facebook"],
+          "META", "america", "NASDAQ", "Meta Platforms (META)")
+_register(["nflx", "netflix"],
+          "NFLX", "america", "NASDAQ", "Netflix (NFLX)")
+_register(["amd"],
+          "AMD", "america", "NASDAQ", "AMD (AMD)")
+_register(["intc", "intel"],
+          "INTC", "america", "NASDAQ", "Intel (INTC)")
+_register(["pltr", "palantir"],
+          "PLTR", "america", "NASDAQ", "Palantir (PLTR)")
+_register(["pypl", "paypal"],
+          "PYPL", "america", "NASDAQ", "PayPal (PYPL)")
+_register(["coin", "coinbase"],
+          "COIN", "america", "NASDAQ", "Coinbase (COIN)")
+_register(["hood", "robinhood"],
+          "HOOD", "america", "NASDAQ", "Robinhood (HOOD)")
+_register(["jpm", "jpmorgan", "jp morgan"],
+          "JPM", "america", "NYSE", "JPMorgan (JPM)")
+_register(["v", "visa"],
+          "V", "america", "NYSE", "Visa (V)")
+_register(["dis", "disney"],
+          "DIS", "america", "NYSE", "Disney (DIS)")
+_register(["ba", "boeing"],
+          "BA", "america", "NYSE", "Boeing (BA)")
+_register(["ko", "coca-cola", "coca cola"],
+          "KO", "america", "NYSE", "Coca-Cola (KO)")
+_register(["jnj", "johnson"],
+          "JNJ", "america", "NYSE", "Johnson & Johnson (JNJ)")
+_register(["gme", "gamestop"],
+          "GME", "america", "NYSE", "GameStop (GME)")
+_register(["amc"],
+          "AMC", "america", "NYSE", "AMC Entertainment (AMC)")
+_register(["nio"],
+          "NIO", "america", "NYSE", "NIO Inc (NIO)")
+_register(["baba", "alibaba"],
+          "BABA", "america", "NYSE", "Alibaba (BABA)")
+
 
 # ── Timeframe extraction from user text ─────────────────────────────────────
 
@@ -323,9 +373,13 @@ def is_ta_request(text: str) -> bool:
 
 def get_supported_symbols_text() -> str:
     """Return a formatted string of all supported symbols for help messages."""
+    # Indices are identified by their specific symbols
+    _INDEX_SYMBOLS = {"SPX", "NDX", "DXY"}
+    
     categories = {
         "Forex": [],
         "Crypto": [],
+        "Stocks": [],
         "Indices": [],
         "Commodities": [],
     }
@@ -338,8 +392,10 @@ def get_supported_symbols_text() -> str:
             categories["Forex"].append(tv.display_name)
         elif tv.screener == "crypto":
             categories["Crypto"].append(tv.display_name)
-        elif tv.screener in ("america",):
+        elif tv.symbol in _INDEX_SYMBOLS:
             categories["Indices"].append(tv.display_name)
+        elif tv.screener == "america":
+            categories["Stocks"].append(tv.display_name)
         elif tv.screener == "cfd":
             categories["Commodities"].append(tv.display_name)
 

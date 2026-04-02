@@ -99,8 +99,8 @@ tokenomics, on-chain analysis, smart-contract basics, CEX/DEX mechanics, \
 yield farming, liquidity pools, airdrops, layer-1/layer-2 ecosystems, \
 Bitcoin, Ethereum, Solana, and the broader altcoin landscape.
 - **Day trading**: forex, commodities (gold, oil, agricultural), indices \
-(S&P 500, NASDAQ, DAX, etc.), macroeconomics, interest-rate cycles, \
-inflation metrics, central-bank policy.
+(S&P 500, NASDAQ, DAX, etc.), US stocks (AAPL, MSFT, TSLA, etc.), \
+macroeconomics, interest-rate cycles, inflation metrics, central-bank policy.
 - **Crypto leverage trading**: perpetual futures, funding rates, margin \
 management, liquidation mechanics, risk-reward sizing, hedging strategies.
 - **Technical analysis**: chart patterns, indicators (RSI, MACD, Bollinger \
@@ -178,7 +178,9 @@ of the question. You MUST:\
   • Highlight risk factors specific to this token\
   • Give actionable observations (e.g., "volume declining = fading interest")\
   NEVER say "I don't have access to live data" when this block is present.\
-  Remind them this is a point-in-time snapshot, not live monitoring, and DYOR.
+  Remind them this is a point-in-time snapshot, not live monitoring, and DYOR.\
+  CRITICAL: Your entire response MUST be under 900 characters. A chart image \
+  is shown alongside your text, so keep it tight — bullet points, no filler.
 
 10. **TradingView Technical Analysis (IMPORTANT)** – When the message contains a \
 "=== LIVE TRADINGVIEW TECHNICAL ANALYSIS ===" block, you MUST provide a \
@@ -200,7 +202,9 @@ You MUST:\
   Keep your response concise — the chart image provides the visual context, \
   so focus your text on interpreting the numbers, not describing the chart.\
   NEVER say "I don't have access to live data" when this block is present.\
-  This is a real-time snapshot, remind them to monitor for updates and DYOR.
+  This is a real-time snapshot, remind them to monitor for updates and DYOR.\
+  CRITICAL: Your entire response MUST be under 900 characters. A chart image \
+  is shown alongside your text, so keep it tight — bullet points, no filler.
 """
 
 
@@ -479,7 +483,7 @@ ON_TOPIC_KEYWORDS = re.compile(
     r"support|resistance|trend|channel|range|consolidat|accumul|distribut|"
     r"swing|scalp|day.?trad|intraday|timeframe|time.?frame|"
     # Technical analysis
-    r"technical.?analy|chart|candle|candlestick|pattern|indicator|"
+    r"technical.?analy|\bta\b|chart|candle|candlestick|pattern|indicator|"
     r"rsi|macd|bollinger|moving.?average|ema|sma|vwap|volume.?profile|"
     r"fibonacci|fib|elliott|ichimoku|stochastic|atr|obv|divergen|"
     r"overbought|oversold|golden.?cross|death.?cross|"
@@ -493,6 +497,9 @@ ON_TOPIC_KEYWORDS = re.compile(
     r"dollar|dxy|eur|gbp|jpy|aud|cad|chf|nzd|gold|silver|oil|crude|"
     r"natural.?gas|wheat|corn|copper|platinum|palladium|"
     r"s&p|s.p.500|nasdaq|dow|russell|dax|ftse|nikkei|hang.?seng|"
+    # Popular stock tickers (on-topic for TA requests)
+    r"aapl|msft|googl|goog|amzn|tsla|nvda|meta|nflx|amd|intc|"
+    r"pltr|pypl|coin|hood|jpm|dis|ba|ko|jnj|gme|amc|nio|baba|"
     # Risk & strategy
     r"risk|reward|r:r|rr|risk.?reward|position.?siz|portfolio|"
     r"diversif|hedge|correlat|drawdown|bankroll|capital|"
@@ -692,8 +699,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
 
     try:
-        # Use more tokens for chart analysis (data-heavy responses)
-        tokens = 1200 if live_context else 800
+        # Chart responses must fit in 1024-char Telegram caption → fewer tokens.
+        has_chart = bool(
+            (tv_symbol and is_ta_request(user_text) and interval)
+            or (has_dex_url and chain and pair_addr)
+        )
+        tokens = 500 if has_chart else (1200 if live_context else 800)
 
         # ── Determine if we should capture a chart screenshot ──
         screenshot_coro = None
@@ -768,12 +779,9 @@ async def _send_reply(
     """
     Send the answer, optionally combined with a chart image.
 
-    Telegram photo captions are limited to 1024 chars.  Strategy:
-      1. If chart_image is provided AND text ≤ 1024 chars → single photo message
-         with the full text as caption.
-      2. If chart_image provided but text > 1024 → photo with first 1024-char
-         portion as caption, then remainder as follow-up text message(s).
-      3. No chart_image → plain text message(s), split at 4096 chars.
+    Telegram photo captions are limited to 1024 chars.
+    If the text exceeds 1024, hard-truncate at the last complete line/sentence.
+    No overflow messages — the AI is instructed to keep chart responses short.
     """
     CAPTION_LIMIT = 1024
 
@@ -781,63 +789,32 @@ async def _send_reply(
         photo = BytesIO(chart_image)
         photo.name = "chart.png"
 
-        if len(answer) <= CAPTION_LIMIT:
-            # Everything fits in one message
+        caption = answer
+        if len(caption) > CAPTION_LIMIT:
+            # Hard truncate at last clean break
+            truncated = caption[:CAPTION_LIMIT]
+            brk = truncated.rfind("\n")
+            if brk < CAPTION_LIMIT // 2:
+                brk = truncated.rfind(". ")
+            if brk < CAPTION_LIMIT // 3:
+                brk = CAPTION_LIMIT - 3
+            caption = truncated[:brk].rstrip() + "…"
+
+        try:
+            await update.effective_message.reply_photo(
+                photo=photo, caption=caption, parse_mode="HTML",
+            )
+        except Exception:
+            clean = re.sub(r'<[^>]+>', '', caption)
+            photo.seek(0)
             try:
                 await update.effective_message.reply_photo(
-                    photo=photo, caption=answer, parse_mode="HTML",
+                    photo=photo, caption=clean,
                 )
-            except Exception:
-                clean = re.sub(r'<[^>]+>', '', answer)
-                photo.seek(0)
-                try:
-                    await update.effective_message.reply_photo(
-                        photo=photo, caption=clean,
-                    )
-                except Exception as exc:
-                    logger.warning("Photo send failed entirely: %s", exc)
-                    await update.effective_message.reply_text(clean)
-            return
-        else:
-            # Caption overflow: send photo with truncated caption,
-            # then remaining text as follow-up message(s)
-            caption_text = answer[:CAPTION_LIMIT]
-            overflow_text = answer[CAPTION_LIMIT:]
-
-            # Try to break at last newline to avoid mid-sentence cut
-            brk = caption_text.rfind("\n", 0, CAPTION_LIMIT)
-            if brk > CAPTION_LIMIT // 2:
-                overflow_text = answer[brk:].lstrip("\n")
-                caption_text = answer[:brk]
-
-            try:
-                await update.effective_message.reply_photo(
-                    photo=photo, caption=caption_text, parse_mode="HTML",
-                )
-            except Exception:
-                clean_cap = re.sub(r'<[^>]+>', '', caption_text)
-                photo.seek(0)
-                try:
-                    await update.effective_message.reply_photo(
-                        photo=photo, caption=clean_cap,
-                    )
-                except Exception as exc:
-                    logger.warning("Photo send failed: %s", exc)
-                    # Fall through to send everything as text
-                    overflow_text = answer
-
-            # Send remaining text as follow-up
-            if overflow_text.strip():
-                chunks = smart_split(overflow_text, 4096)
-                for chunk in chunks:
-                    try:
-                        await update.effective_message.reply_text(
-                            chunk, parse_mode="HTML",
-                        )
-                    except Exception:
-                        clean = re.sub(r'<[^>]+>', '', chunk)
-                        await update.effective_message.reply_text(clean)
-            return
+            except Exception as exc:
+                logger.warning("Photo send failed entirely: %s", exc)
+                await update.effective_message.reply_text(clean)
+        return
 
     # No chart image — plain text
     chunks = smart_split(answer, 4096)
@@ -845,7 +822,6 @@ async def _send_reply(
         try:
             await update.effective_message.reply_text(chunk, parse_mode="HTML")
         except Exception:
-            # If HTML parsing fails, strip tags and send as plain text
             clean = re.sub(r'<[^>]+>', '', chunk)
             await update.effective_message.reply_text(clean)
 
