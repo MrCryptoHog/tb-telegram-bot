@@ -21,6 +21,8 @@ import time
 import hashlib
 from collections import OrderedDict
 from dotenv import load_dotenv
+import asyncio
+from io import BytesIO
 import httpx
 from telegram import Update
 from telegram.ext import (
@@ -32,6 +34,7 @@ from telegram.ext import (
 
 from providers import ProviderManager
 from rate_limiter import RateLimiter
+from charts import screenshot_tradingview_chart, screenshot_dexscreener_chart
 from tradingview import (
     extract_symbol,
     extract_interval,
@@ -637,12 +640,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Show typing indicator ──
+    chat_action = "upload_photo" if has_live_data else "typing"
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
+        chat_id=update.effective_chat.id, action=chat_action
     )
 
     # ── Check for DexScreener URLs → fetch live data ──
     dex_context = ""
+    chain = pair_addr = None
     dex_urls = extract_dexscreener_urls(user_text) if has_dex_url else []
     if dex_urls:
         chain, pair_addr = dex_urls[0]  # Use first URL found
@@ -661,6 +666,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Check for TradingView TA request → fetch live indicators ──
     tv_context = ""
+    interval = None
     if tv_symbol and is_ta_request(user_text):
         interval = extract_interval(user_text)
         logger.info("TradingView TA request: %s (%s)", tv_symbol.display_name, interval)
@@ -682,11 +688,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Use more tokens for chart analysis (data-heavy responses)
         tokens = 1200 if live_context else 800
-        answer, provider_name = await provider_mgr.generate(
-            system_prompt=SYSTEM_PROMPT,
-            user_message=prompt,
-            max_tokens=tokens,
-        )
+
+        # ── Determine if we should capture a chart screenshot ──
+        screenshot_coro = None
+        chart_caption = ""
+        if tv_symbol and is_ta_request(user_text) and interval:
+            screenshot_coro = screenshot_tradingview_chart(
+                tv_symbol.symbol, tv_symbol.exchange, interval
+            )
+            chart_caption = f"📊 {tv_symbol.display_name} — {interval}"
+        elif has_dex_url and chain and pair_addr:
+            screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
+            chart_caption = "📊 DexScreener Chart"
+
+        # ── Run AI call (+ screenshot in parallel if applicable) ──
+        chart_image = None
+        if screenshot_coro:
+            results = await asyncio.gather(
+                provider_mgr.generate(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_message=prompt,
+                    max_tokens=tokens,
+                ),
+                screenshot_coro,
+                return_exceptions=True,
+            )
+            # Unpack AI result (must succeed)
+            if isinstance(results[0], Exception):
+                raise results[0]
+            answer, provider_name = results[0]
+            # Unpack screenshot (graceful — None on failure)
+            if isinstance(results[1], Exception):
+                logger.warning("Chart screenshot failed: %s", results[1])
+            else:
+                chart_image = results[1]
+        else:
+            answer, provider_name = await provider_mgr.generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_message=prompt,
+                max_tokens=tokens,
+            )
 
         logger.info("Response from %s (%d chars)", provider_name, len(answer))
 
@@ -702,6 +743,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Cache the sanitized response
         response_cache.put(user_text, answer)
+
+        # ── Send chart image first (if captured) ──
+        if chart_image:
+            try:
+                photo = BytesIO(chart_image)
+                photo.name = "chart.png"
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=photo,
+                    caption=chart_caption,
+                    reply_to_message_id=update.effective_message.message_id,
+                )
+            except Exception as photo_exc:
+                logger.warning("Failed to send chart photo: %s", photo_exc)
 
         await _send_reply(update, answer)
 

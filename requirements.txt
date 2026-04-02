@@ -2,3 +2,4 @@ python-telegram-bot[webhooks]==21.*
 python-dotenv>=1.0.0
 httpx>=0.27.0
 tradingview_ta>=3.3.0
+playwright>=1.40.0
