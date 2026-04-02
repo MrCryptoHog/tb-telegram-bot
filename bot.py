@@ -138,10 +138,16 @@ trading, investing, finance, or crypto, gently redirect: "That's a bit \
 outside my wheelhouse! I'm here to help with trading, crypto, and market \
 strategy questions. What can I help you with on that front?"
 
-8. **Telegram formatting** – Use Telegram-compatible Markdown \
-(bold with *, italic with _, code with `, etc.). Do NOT use headers \
-with ## or ### or complex markdown that Telegram won't render. Use bold \
-text and line breaks to structure your answers instead.
+8. **Telegram HTML formatting** – You MUST format replies using Telegram HTML \
+tags, NOT Markdown. Use these tags:\
+  <b>bold</b> for emphasis\
+  <i>italic</i> for secondary emphasis\
+  <code>inline code</code> for technical terms\
+  <pre>code blocks</pre> for multi-line code\
+  DO NOT use *, **, _, __, `, ```, ##, or any Markdown syntax.\
+  Use <b> and <i> tags instead of asterisks and underscores.\
+  Use line breaks and <b>bold headers</b> to structure answers.\
+  Bullet points with • or numbered lists are fine as plain text.
 """
 
 # ── Response cache (saves rate limits for repeated questions) ────────────────
@@ -199,6 +205,51 @@ PSYCHOLOGY_FOOTER = (
     "\n\n🧠 For a quick psychology check, type /psychology in the group to take "
     "our dedicated quiz bot's 10-question test and get your score out of 10!"
 )
+
+
+def sanitize_for_html(text: str) -> str:
+    """
+    Convert any remaining Markdown artifacts in the AI response to Telegram HTML.
+    Handles: **bold**, *italic*, `code`, ###headers, bullet dashes.
+    Also escapes bare < and > that aren't part of allowed HTML tags.
+    """
+    import html as html_mod
+
+    # Preserve allowed HTML tags by replacing them with placeholders
+    import uuid
+    placeholders = {}
+    allowed_tags = ['b', 'i', 'code', 'pre', 'u', 's', 'a']
+    tag_pattern = re.compile(
+        r'(</?(?:' + '|'.join(allowed_tags) + r')(?:\s[^>]*)?>)',
+        re.IGNORECASE
+    )
+
+    def save_tag(m):
+        key = f'__TAG_{uuid.uuid4().hex[:8]}__'
+        placeholders[key] = m.group(0)
+        return key
+
+    text = tag_pattern.sub(save_tag, text)
+
+    # Escape any remaining HTML-special characters
+    text = html_mod.escape(text)
+
+    # Restore allowed tags
+    for key, tag in placeholders.items():
+        text = text.replace(html_mod.escape(key), tag)
+
+    # Convert Markdown bold **text** → <b>text</b>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # Convert Markdown italic *text* → <i>text</i> (but not inside <b> tags)
+    text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<i>\1</i>', text)
+    # Convert _italic_ → <i>italic</i>
+    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<i>\1</i>', text)
+    # Convert `code` → <code>code</code>
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+    # Convert ### headers → bold line
+    text = re.sub(r'^#{1,3}\s*(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
+    return text
 
 
 def mentions_psychology(text: str) -> bool:
@@ -271,13 +322,13 @@ GREETING_PATTERN = re.compile(
 )
 
 OFF_TOPIC_REPLY = (
-    "Hey! I only answer questions about *crypto*, *trading*, *forex*, "
-    "*macro*, and related topics like *technical analysis*, *risk management*, "
-    "and *trading psychology*. 📊\n\n"
+    "Hey! I only answer questions about <b>crypto</b>, <b>trading</b>, <b>forex</b>, "
+    "<b>macro</b>, and related topics like <b>technical analysis</b>, <b>risk management</b>, "
+    "and <b>trading psychology</b>. 📊\n\n"
     "Try asking me something like:\n"
-    "• _How do I manage risk on a leveraged trade?_\n"
-    "• _What's a good strategy for swing trading altcoins?_\n"
-    "• _How does the RSI indicator work?_"
+    "• <i>How do I manage risk on a leveraged trade?</i>\n"
+    "• <i>What's a good strategy for swing trading altcoins?</i>\n"
+    "• <i>How does the RSI indicator work?</i>"
 )
 
 
@@ -368,7 +419,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Off-topic filter (zero API cost!) ──
     if not is_on_topic(user_text):
         logger.info("Off-topic from %s — rejected locally (0 API calls used)", user_name)
-        await update.effective_message.reply_text(OFF_TOPIC_REPLY, parse_mode="Markdown")
+        await update.effective_message.reply_text(OFF_TOPIC_REPLY, parse_mode="HTML")
         return
 
     # ── Check cache first (costs zero rate limit!) ──
@@ -412,6 +463,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Cache the response
         response_cache.put(user_text, answer)
 
+        # Sanitize any stray Markdown into HTML
+        answer = sanitize_for_html(answer)
+
         await _send_reply(update, answer)
 
     except Exception as exc:
@@ -422,14 +476,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_reply(update: Update, answer: str):
-    """Send the answer, splitting if needed, with Markdown fallback."""
+    """Send the answer, splitting if needed, with HTML fallback to plain text."""
     chunks = smart_split(answer, 4096)
     for chunk in chunks:
         try:
-            await update.effective_message.reply_text(chunk, parse_mode="Markdown")
+            await update.effective_message.reply_text(chunk, parse_mode="HTML")
         except Exception:
-            # If Markdown parsing fails, send as plain text
-            await update.effective_message.reply_text(chunk)
+            # If HTML parsing fails, strip tags and send as plain text
+            clean = re.sub(r'<[^>]+>', '', chunk)
+            await update.effective_message.reply_text(clean)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
