@@ -190,9 +190,27 @@ _GT_CHAIN_MAP = {
 }
 
 
+# ── GeckoTerminal timeframe button map ──
+# Maps common interval strings to the button text visible in
+# the GeckoTerminal TradingView embed toolbar.
+_GT_TIMEFRAME_BUTTONS = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "D",
+    "1D": "D",
+    "1w": "D",     # GT embed doesn't have weekly — use daily
+    "1W": "D",
+    "1M": "D",
+}
+
+
 async def screenshot_geckoterminal_chart(
     chain: str,
     pair_address: str,
+    interval: str = "1h",
     width: int = 1280,
     height: int = 900,
 ) -> Optional[bytes]:
@@ -201,6 +219,11 @@ async def screenshot_geckoterminal_chart(
 
     Uses GeckoTerminal's embed page which does NOT have Cloudflare blocking,
     unlike DexScreener's main site which returns 403 to headless browsers.
+
+    Parameters:
+        chain: DexScreener chain ID (e.g. "ethereum", "solana")
+        pair_address: The pair/pool contract address
+        interval: Timeframe string like "1h", "4h", "1d" etc.
 
     Returns PNG bytes on success, None on failure.
     """
@@ -216,52 +239,72 @@ async def screenshot_geckoterminal_chart(
             f"https://www.geckoterminal.com/{gt_chain}/pools/{pair_address}"
             f"?embed=1&info=0&swaps=0"
         )
-        logger.info("GeckoTerminal chart URL: %s", url)
+        logger.info("GeckoTerminal chart URL: %s (interval=%s)", url, interval)
 
-        await page.goto(url, wait_until="networkidle", timeout=30_000)
+        # Load the page — use domcontentloaded (faster) since the chart
+        # data streams in via JS/WebSocket after initial load anyway.
+        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
 
-        # Wait for chart canvas to appear
+        # ── Click the correct timeframe button ──
+        tf_btn = _GT_TIMEFRAME_BUTTONS.get(interval, "1h")
         try:
-            await page.wait_for_selector("canvas", timeout=12_000)
-        except Exception:
-            logger.warning("GeckoTerminal canvas not found, using timed wait")
+            # The timeframe buttons are in the top toolbar: 1s 1m 5m 15m 1h 4h D
+            btn = page.locator(f'button:text-is("{tf_btn}")').first
+            await btn.wait_for(state="visible", timeout=10_000)
+            await btn.click()
+            logger.info("Clicked timeframe button: %s", tf_btn)
+            # Wait for chart to re-render with new timeframe data
+            await page.wait_for_timeout(2_000)
+        except Exception as tf_exc:
+            logger.warning("Could not click timeframe %s: %s", tf_btn, tf_exc)
 
-        # Wait for candlestick data to actually render inside the chart.
-        # The embed uses a TradingView widget — we poll until the OHLC
-        # header shows real numbers (not just zeros/placeholders), which
-        # proves the price data streamed in and the chart is drawn.
-        for _ in range(12):                 # up to ~6 more seconds
-            has_data = await page.evaluate("""
+        # ── Wait for chart to fully render with candlestick data ──
+        # Strategy: wait for multiple canvases (TradingView creates several)
+        # then poll until pixel data shows the chart is drawn (not blank).
+        try:
+            await page.wait_for_selector("canvas", timeout=15_000)
+        except Exception:
+            logger.warning("GeckoTerminal canvas not found")
+
+        # Poll: check if chart canvases have non-blank content by
+        # sampling pixel data from the main chart canvas.
+        for attempt in range(20):          # up to ~10 seconds
+            has_content = await page.evaluate("""
                 () => {
-                    // Check OHLC header values — non-zero means data loaded
-                    const vals = document.querySelectorAll(
-                        '[class*="valuesWrapper"] span, '
-                        + '[class*="headerWrapper"] [class*="value"]'
-                    );
-                    for (const v of vals) {
-                        const t = v.textContent?.trim();
-                        if (t && /[1-9]/.test(t)) return true;
-                    }
-                    // Fallback: check if any price label on the Y-axis exists
-                    const axis = document.querySelectorAll(
-                        '[class*="price"], [class*="axis"] text'
-                    );
-                    for (const a of axis) {
-                        const t = a.textContent?.trim();
-                        if (t && /\\d+\\.\\d+/.test(t)) return true;
+                    const canvases = document.querySelectorAll('canvas');
+                    for (const c of canvases) {
+                        if (c.width < 100 || c.height < 100) continue;
+                        try {
+                            const ctx = c.getContext('2d');
+                            if (!ctx) continue;
+                            // Sample pixels from the chart area (middle region)
+                            const w = c.width, h = c.height;
+                            const data = ctx.getImageData(
+                                Math.floor(w * 0.2), Math.floor(h * 0.2),
+                                Math.floor(w * 0.6), Math.floor(h * 0.4)
+                            ).data;
+                            // Count non-background pixels (not pure dark)
+                            let colored = 0;
+                            for (let i = 0; i < data.length; i += 16) {
+                                const r = data[i], g = data[i+1], b = data[i+2];
+                                // GeckoTerminal dark theme background is ~(19,23,34)
+                                if (r > 30 || g > 35 || b > 45) colored++;
+                            }
+                            if (colored > 50) return true;
+                        } catch(e) {}
                     }
                     return false;
                 }
             """)
-            if has_data:
-                logger.info("GeckoTerminal chart data detected, taking screenshot")
+            if has_content:
+                logger.info("GeckoTerminal chart content detected (attempt %d)", attempt + 1)
                 break
             await page.wait_for_timeout(500)
         else:
-            logger.warning("GeckoTerminal chart data not detected, screenshotting anyway")
+            logger.warning("GeckoTerminal chart may be blank, screenshotting anyway")
 
-        # Final settle time for rendering to complete
-        await page.wait_for_timeout(2_000)
+        # Final settle for any remaining animation
+        await page.wait_for_timeout(1_500)
 
         screenshot = await page.screenshot(type="png")
         await page.close()

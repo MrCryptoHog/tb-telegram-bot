@@ -858,7 +858,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── GeckoTerminal chart screenshot + AI call in parallel ──
         if has_dex_chart and not chart_image:
-            dex_screenshot_coro = screenshot_geckoterminal_chart(chain, pair_addr)
+            # Extract timeframe from user text for the chart (default 1h)
+            dex_interval = extract_interval(user_text) if not interval else interval
+            dex_screenshot_coro = screenshot_geckoterminal_chart(
+                chain, pair_addr, interval=dex_interval
+            )
             results = await asyncio.gather(
                 provider_mgr.generate(
                     system_prompt=SYSTEM_PROMPT,
