@@ -206,6 +206,95 @@ def mentions_psychology(text: str) -> bool:
     return bool(PSYCHOLOGY_KEYWORDS.search(text))
 
 
+# ── On-topic filter (rejects off-topic BEFORE hitting AI = free) ─────────────
+
+ON_TOPIC_KEYWORDS = re.compile(
+    r"\b("
+    # Crypto
+    r"crypt|bitcoin|btc|ethereum|eth|solana|sol|altcoin|token|defi|nft|"
+    r"blockchain|web3|wallet|staking|yield|airdrop|dex|cex|swap|liquidity|"
+    r"memecoin|meme.?coin|shitcoin|microcap|micro.?cap|lowcap|low.?cap|"
+    r"midcap|mid.?cap|largecap|large.?cap|hodl|whale|pump|dump|rug.?pull|"
+    r"tokenomics|smart.?contract|layer.?[12]|l[12]|bridge|chain|gas.?fee|"
+    r"mining|halving|satoshi|gwei|binance|coinbase|kraken|bybit|okx|"
+    r"uniswap|pancakeswap|raydium|jupiter|phantom|metamask|ledger|"
+    r"usdt|usdc|stablecoin|pepe|doge|shib|xrp|ada|avax|matic|bnb|"
+    r"link|dot|atom|near|apt|sui|arb|op|ftm|sei|inj|tia|jup|wif|bonk|"
+    r"onchain|on.?chain|tvl|mcap|market.?cap|volume|pumpfun|pump\.fun|"
+    # Trading general
+    r"trad(?:e|ing|er)|forex|fx|commodit|indices|index|futures|options|"
+    r"stock|equit|share|market|bull(?:ish)?|bear(?:ish)?|long|short|"
+    r"leverage|margin|liquidat|perpetual|perp|spot|position|order|"
+    r"limit.?order|market.?order|stop.?loss|take.?profit|tp|sl|"
+    r"entry|exit|breakout|breakdown|pullback|retracement|reversal|"
+    r"support|resistance|trend|channel|range|consolidat|accumul|distribut|"
+    r"swing|scalp|day.?trad|intraday|timeframe|time.?frame|"
+    # Technical analysis
+    r"technical.?analy|chart|candle|candlestick|pattern|indicator|"
+    r"rsi|macd|bollinger|moving.?average|ema|sma|vwap|volume.?profile|"
+    r"fibonacci|fib|elliott|ichimoku|stochastic|atr|obv|divergen|"
+    r"overbought|oversold|golden.?cross|death.?cross|"
+    r"head.?and.?shoulder|double.?top|double.?bottom|triangle|wedge|flag|"
+    r"pennant|cup.?and.?handle|gap|wick|doji|hammer|engulf|"
+    r"order.?flow|order.?book|bid|ask|spread|slippage|"
+    # Macro / fundamentals
+    r"macro|econom|inflat|deflat|interest.?rate|fed|federal.?reserve|"
+    r"central.?bank|gdp|cpi|ppi|employment|payroll|recession|"
+    r"monetary|fiscal|quantitative|tapering|yield.?curve|bond|treasur|"
+    r"dollar|dxy|eur|gbp|jpy|aud|cad|chf|nzd|gold|silver|oil|crude|"
+    r"natural.?gas|wheat|corn|copper|platinum|palladium|"
+    r"s&p|s.p.500|nasdaq|dow|russell|dax|ftse|nikkei|hang.?seng|"
+    # Risk & strategy
+    r"risk|reward|r:r|rr|risk.?reward|position.?siz|portfolio|"
+    r"diversif|hedge|correlat|drawdown|bankroll|capital|"
+    r"backtest|journal|edge|expectancy|win.?rate|loss.?rate|"
+    r"strategy|setup|plan|system|method|approach|"
+    # Psychology (also on-topic)
+    r"psychology|mindset|discipline|emotional|fomo|fear|greed|"
+    r"revenge.?trad|tilt|burnout|confidence|stress|frustrat|"
+    r"bias|cognitive|overtrading|impulsiv|"
+    # General finance
+    r"invest|profit|loss|pnl|p&l|roi|return|compound|dca|"
+    r"dollar.?cost|buy|sell|accumulate|allocat|rebalanc|"
+    r"fundamentals|valuation|earnings|revenue|"
+    # Common question patterns about the above
+    r"price.?action|pa|money.?management|mm|"
+    r"technical|analysis|signal|setup|confluenc"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Short messages (< 4 words) that are greetings / noise — skip topic check
+GREETING_PATTERN = re.compile(
+    r"^(hi|hey|hello|yo|sup|thanks|thank you|gm|gn|wb|cheers|ok|okay)\s*[!?.]*$",
+    re.IGNORECASE,
+)
+
+OFF_TOPIC_REPLY = (
+    "Hey! I only answer questions about *crypto*, *trading*, *forex*, "
+    "*macro*, and related topics like *technical analysis*, *risk management*, "
+    "and *trading psychology*. 📊\n\n"
+    "Try asking me something like:\n"
+    "• _How do I manage risk on a leveraged trade?_\n"
+    "• _What's a good strategy for swing trading altcoins?_\n"
+    "• _How does the RSI indicator work?_"
+)
+
+
+def is_on_topic(text: str) -> bool:
+    """
+    Return True if the message is related to trading/crypto/finance.
+    Very short messages (greetings) are treated as on-topic to avoid
+    false-rejecting things like 'thanks' or 'hi'.
+    """
+    cleaned = text.strip()
+    # Let very short messages through (greetings, follow-ups)
+    if len(cleaned.split()) <= 3:
+        return True
+    # If it matches any on-topic keyword, it's good
+    return bool(ON_TOPIC_KEYWORDS.search(cleaned))
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def strip_mention(text: str, username: str) -> str:
@@ -275,6 +364,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name or "trader"
     logger.info("Question from %s (id=%s): %s", user_name, user_id, user_text[:120])
+
+    # ── Off-topic filter (zero API cost!) ──
+    if not is_on_topic(user_text):
+        logger.info("Off-topic from %s — rejected locally (0 API calls used)", user_name)
+        await update.effective_message.reply_text(OFF_TOPIC_REPLY, parse_mode="Markdown")
+        return
 
     # ── Check cache first (costs zero rate limit!) ──
     cached = response_cache.get(user_text)
