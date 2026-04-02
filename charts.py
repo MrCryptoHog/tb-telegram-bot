@@ -218,16 +218,50 @@ async def screenshot_geckoterminal_chart(
         )
         logger.info("GeckoTerminal chart URL: %s", url)
 
-        await page.goto(url, wait_until="load", timeout=20_000)
+        await page.goto(url, wait_until="networkidle", timeout=30_000)
 
-        # Wait for chart canvas to render
+        # Wait for chart canvas to appear
         try:
             await page.wait_for_selector("canvas", timeout=12_000)
         except Exception:
             logger.warning("GeckoTerminal canvas not found, using timed wait")
 
-        # Give chart JS time to finish rendering candlesticks
-        await page.wait_for_timeout(4_000)
+        # Wait for candlestick data to actually render inside the chart.
+        # The embed uses a TradingView widget — we poll until the OHLC
+        # header shows real numbers (not just zeros/placeholders), which
+        # proves the price data streamed in and the chart is drawn.
+        for _ in range(12):                 # up to ~6 more seconds
+            has_data = await page.evaluate("""
+                () => {
+                    // Check OHLC header values — non-zero means data loaded
+                    const vals = document.querySelectorAll(
+                        '[class*="valuesWrapper"] span, '
+                        + '[class*="headerWrapper"] [class*="value"]'
+                    );
+                    for (const v of vals) {
+                        const t = v.textContent?.trim();
+                        if (t && /[1-9]/.test(t)) return true;
+                    }
+                    // Fallback: check if any price label on the Y-axis exists
+                    const axis = document.querySelectorAll(
+                        '[class*="price"], [class*="axis"] text'
+                    );
+                    for (const a of axis) {
+                        const t = a.textContent?.trim();
+                        if (t && /\\d+\\.\\d+/.test(t)) return true;
+                    }
+                    return false;
+                }
+            """)
+            if has_data:
+                logger.info("GeckoTerminal chart data detected, taking screenshot")
+                break
+            await page.wait_for_timeout(500)
+        else:
+            logger.warning("GeckoTerminal chart data not detected, screenshotting anyway")
+
+        # Final settle time for rendering to complete
+        await page.wait_for_timeout(2_000)
 
         screenshot = await page.screenshot(type="png")
         await page.close()
