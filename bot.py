@@ -749,7 +749,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cached = response_cache.get(user_text)
         if cached:
             logger.info("Cache hit — serving cached response (no rate limit used)")
-            await _send_reply(update, cached)
+            await _send_reply(update, cached, context=context)
             return
 
     # ── Rate limit check (only for non-cached / actual API calls) ──
@@ -909,9 +909,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Send response (with chart image if captured) ──
         if chart_image:
-            await _send_reply(update, answer, chart_image=chart_image)
+            await _send_reply(update, answer, chart_image=chart_image, context=context)
         else:
-            await _send_reply(update, answer)
+            await _send_reply(update, answer, context=context)
 
     except Exception as exc:
         logger.exception("All providers failed: %s", exc)
@@ -925,6 +925,7 @@ async def _send_reply(
     update: Update,
     answer: str,
     chart_image: bytes | None = None,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ):
     """
     Send the answer, optionally combined with a chart image.
@@ -932,8 +933,13 @@ async def _send_reply(
     Telegram photo captions are limited to 1024 chars.
     If the text exceeds 1024, hard-truncate at the last complete line/sentence.
     No overflow messages — the AI is instructed to keep chart responses short.
+
+    Falls back to send_message/send_photo (without reply-to) if the original
+    message is gone (e.g. deleted, or stale update from deploy restart).
     """
     CAPTION_LIMIT = 1024
+    chat_id = update.effective_chat.id
+    bot = context.bot if context else update.get_bot()
 
     if chart_image:
         photo = BytesIO(chart_image)
@@ -950,20 +956,38 @@ async def _send_reply(
                 brk = CAPTION_LIMIT - 3
             caption = truncated[:brk].rstrip() + "…"
 
-        try:
-            await update.effective_message.reply_photo(
-                photo=photo, caption=caption, parse_mode="HTML",
-            )
-        except Exception:
-            clean = re.sub(r'<[^>]+>', '', caption)
-            photo.seek(0)
+        # Try reply_photo → send_photo (no reply-to) → send plain text
+        for attempt, use_html in [(1, True), (2, True), (3, False), (4, False)]:
             try:
-                await update.effective_message.reply_photo(
-                    photo=photo, caption=clean,
-                )
+                clean_cap = caption if use_html else re.sub(r'<[^>]+>', '', caption)
+                pm = "HTML" if use_html else None
+                photo.seek(0)
+                if attempt <= 2:
+                    try:
+                        await update.effective_message.reply_photo(
+                            photo=photo, caption=clean_cap, parse_mode=pm,
+                        )
+                        return
+                    except Exception:
+                        if attempt == 1:
+                            continue  # retry as send_photo
+                        raise
+                else:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=photo,
+                        caption=clean_cap, parse_mode=pm,
+                    )
+                    return
             except Exception as exc:
+                if attempt < 4:
+                    continue
+                # Last resort: send as plain text
                 logger.warning("Photo send failed entirely: %s", exc)
-                await update.effective_message.reply_text(clean)
+                clean = re.sub(r'<[^>]+>', '', caption)
+                try:
+                    await bot.send_message(chat_id=chat_id, text=clean)
+                except Exception:
+                    logger.error("Could not send response at all")
         return
 
     # No chart image — plain text
@@ -973,7 +997,16 @@ async def _send_reply(
             await update.effective_message.reply_text(chunk, parse_mode="HTML")
         except Exception:
             clean = re.sub(r'<[^>]+>', '', chunk)
-            await update.effective_message.reply_text(clean)
+            try:
+                await update.effective_message.reply_text(clean)
+            except Exception:
+                # Original message gone — send without reply-to
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id, text=clean,
+                    )
+                except Exception as exc:
+                    logger.error("Could not send chunk: %s", exc)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
