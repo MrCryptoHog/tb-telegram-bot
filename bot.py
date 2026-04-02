@@ -21,6 +21,7 @@ import time
 import hashlib
 from collections import OrderedDict
 from dotenv import load_dotenv
+import httpx
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -148,7 +149,112 @@ tags, NOT Markdown. Use these tags:\
   Use <b> and <i> tags instead of asterisks and underscores.\
   Use line breaks and <b>bold headers</b> to structure answers.\
   Bullet points with • or numbered lists are fine as plain text.
+
+9. **Chart / Token Analysis** – When the user provides live token data \
+(price, volume, liquidity, price changes, etc.), you DO have data to work with. \
+Provide a concise technical analysis based on the numbers given. Cover:\
+  • Current price action & momentum (based on 5m/1h/6h/24h changes)\
+  • Volume analysis (buy vs sell pressure if available)\
+  • Liquidity assessment\
+  • Key observations (rapid price moves, unusual volume, market cap vs FDV)\
+  • Risk factors & what to watch for\
+  Always remind them this is based on a snapshot in time, not live monitoring, \
+and that they should DYOR.
 """
+
+
+# ── DexScreener integration (free API, no key needed) ───────────────────────
+
+# Regex to match DexScreener URLs and extract chain + pair address
+DEXSCREENER_URL_PATTERN = re.compile(
+    r'https?://(?:www\.)?dexscreener\.com/([\w-]+)/(0x[a-fA-F0-9]{40})',
+    re.IGNORECASE,
+)
+
+
+def extract_dexscreener_urls(text: str) -> list[tuple[str, str]]:
+    """Extract (chain, pair_address) tuples from DexScreener URLs in text."""
+    return DEXSCREENER_URL_PATTERN.findall(text)
+
+
+async def fetch_dexscreener_data(chain: str, pair_address: str) -> dict | None:
+    """
+    Fetch token pair data from DexScreener's free public API.
+    Returns parsed JSON dict or None on failure.
+    """
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("pairs") and len(data["pairs"]) > 0:
+                return data["pairs"][0]
+            # Try the token endpoint as fallback
+            url2 = f"https://api.dexscreener.com/latest/dex/tokens/{pair_address}"
+            resp2 = await client.get(url2)
+            resp2.raise_for_status()
+            data2 = resp2.json()
+            if data2.get("pairs") and len(data2["pairs"]) > 0:
+                return data2["pairs"][0]
+            return None
+    except Exception as exc:
+        logger.warning("DexScreener API error for %s/%s: %s", chain, pair_address, exc)
+        return None
+
+
+def format_dexscreener_context(pair: dict) -> str:
+    """
+    Format DexScreener pair data into a readable context block
+    that gets injected into the AI prompt.
+    """
+    base = pair.get("baseToken", {})
+    quote = pair.get("quoteToken", {})
+    price_change = pair.get("priceChange", {})
+    volume = pair.get("volume", {})
+    liquidity = pair.get("liquidity", {})
+    txns = pair.get("txns", {})
+
+    # Format transaction data
+    txn_lines = []
+    for period, label in [("m5", "5min"), ("h1", "1hr"), ("h6", "6hr"), ("h24", "24hr")]:
+        t = txns.get(period, {})
+        if t:
+            txn_lines.append(f"  {label}: {t.get('buys', '?')} buys / {t.get('sells', '?')} sells")
+
+    lines = [
+        f"=== LIVE TOKEN DATA (from DexScreener) ===",
+        f"Token: {base.get('name', '?')} ({base.get('symbol', '?')})",
+        f"Pair: {base.get('symbol', '?')}/{quote.get('symbol', '?')}",
+        f"Chain: {pair.get('chainId', '?')}",
+        f"DEX: {pair.get('dexId', '?')}",
+        f"Price (USD): ${pair.get('priceUsd', '?')}",
+        f"Price ({quote.get('symbol', 'quote')}): {pair.get('priceNative', '?')}",
+        f"",
+        f"Price Changes:",
+        f"  5min:  {price_change.get('m5', '?')}%",
+        f"  1hr:   {price_change.get('h1', '?')}%",
+        f"  6hr:   {price_change.get('h6', '?')}%",
+        f"  24hr:  {price_change.get('h24', '?')}%",
+        f"",
+        f"Volume:",
+        f"  5min:  ${volume.get('m5', '?')}",
+        f"  1hr:   ${volume.get('h1', '?')}",
+        f"  6hr:   ${volume.get('h6', '?')}",
+        f"  24hr:  ${volume.get('h24', '?')}",
+        f"",
+        f"Transactions:",
+    ]
+    lines.extend(txn_lines if txn_lines else ["  No transaction data available"])
+    lines.extend([
+        f"",
+        f"Liquidity (USD): ${liquidity.get('usd', '?')}",
+        f"Market Cap: ${pair.get('marketCap', '?')}" if pair.get('marketCap') else "Market Cap: N/A",
+        f"FDV: ${pair.get('fdv', '?')}" if pair.get('fdv') else "FDV: N/A",
+        f"Pair created: {pair.get('pairCreatedAt', 'unknown')}",
+        f"=========================",
+    ])
+    return "\n".join(lines)
 
 # ── Response cache (saves rate limits for repeated questions) ────────────────
 
@@ -387,8 +493,12 @@ def is_on_topic(text: str) -> bool:
     Return True if the message is related to trading/crypto/finance.
     Very short messages (greetings) are treated as on-topic to avoid
     false-rejecting things like 'thanks' or 'hi'.
+    DexScreener URLs are always on-topic.
     """
     cleaned = text.strip()
+    # DexScreener / chart URLs are always on-topic
+    if DEXSCREENER_URL_PATTERN.search(cleaned):
+        return True
     # Let very short messages through (greetings, follow-ups)
     if len(cleaned.split()) <= 3:
         return True
@@ -491,8 +601,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action="typing"
     )
 
+    # ── Check for DexScreener URLs → fetch live data ──
+    dex_context = ""
+    dex_urls = extract_dexscreener_urls(user_text)
+    if dex_urls:
+        chain, pair_addr = dex_urls[0]  # Use first URL found
+        logger.info("DexScreener URL detected: %s/%s — fetching data", chain, pair_addr)
+        pair_data = await fetch_dexscreener_data(chain, pair_addr)
+        if pair_data:
+            dex_context = "\n\n" + format_dexscreener_context(pair_data)
+            token_name = pair_data.get("baseToken", {}).get("symbol", "token")
+            logger.info("DexScreener data fetched for %s (%d bytes)",
+                       token_name, len(dex_context))
+        else:
+            dex_context = ("\n\n[Note: User shared a DexScreener link but "
+                          "the API returned no data for this pair. "
+                          "Acknowledge the link and offer general guidance.]")
+            logger.warning("DexScreener returned no data for %s/%s", chain, pair_addr)
+
     # ── Query AI with multi-provider fallback ──
-    prompt = f"[Group member {user_name} asks]: {user_text}"
+    prompt = f"[Group member {user_name} asks]: {user_text}{dex_context}"
 
     try:
         answer, provider_name = await provider_mgr.generate(
