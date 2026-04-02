@@ -209,19 +209,36 @@ PSYCHOLOGY_FOOTER = (
 
 def sanitize_for_html(text: str) -> str:
     """
-    Convert any remaining Markdown artifacts in the AI response to Telegram HTML.
-    Handles: **bold**, *italic*, `code`, ###headers, bullet dashes.
-    Also escapes bare < and > that aren't part of allowed HTML tags.
+    Bullet-proof Markdown → Telegram-HTML converter.
+    Handles: bullet lists, ```code blocks```, `inline code`, ***bold-italic***,
+    **bold**, *italic*, _italic_, __bold__, ###headers, [links](url).
+    Also escapes bare HTML so Telegram's parser never chokes.
     """
     import html as html_mod
-
-    # Preserve allowed HTML tags by replacing them with placeholders
     import uuid
-    placeholders = {}
+
+    # ── 0. Convert bullet-point asterisks BEFORE anything else ──────────
+    #   "* item"  →  "• item"   (prevents confusion with italic markers)
+    text = re.sub(r'^\s*\*\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*-\s+', '• ', text, flags=re.MULTILINE)
+
+    # ── 1. Stash fenced code blocks so nothing inside gets mangled ──────
+    code_blocks: dict[str, str] = {}
+
+    def stash_code_block(m):
+        key = f'__CODEBLOCK_{uuid.uuid4().hex[:8]}__'
+        # Keep content, escape HTML inside it
+        code_blocks[key] = f'<pre>{html_mod.escape(m.group(2))}</pre>'
+        return key
+
+    text = re.sub(r'```(\w*)\n?([\s\S]*?)```', stash_code_block, text)
+
+    # ── 2. Preserve any existing valid HTML tags ────────────────────────
+    placeholders: dict[str, str] = {}
     allowed_tags = ['b', 'i', 'code', 'pre', 'u', 's', 'a']
     tag_pattern = re.compile(
         r'(</?(?:' + '|'.join(allowed_tags) + r')(?:\s[^>]*)?>)',
-        re.IGNORECASE
+        re.IGNORECASE,
     )
 
     def save_tag(m):
@@ -231,23 +248,36 @@ def sanitize_for_html(text: str) -> str:
 
     text = tag_pattern.sub(save_tag, text)
 
-    # Escape any remaining HTML-special characters
+    # ── 3. Escape HTML-special characters (&, <, >) ────────────────────
     text = html_mod.escape(text)
 
-    # Restore allowed tags
+    # ── 4. Restore stashed tags & code blocks ──────────────────────────
     for key, tag in placeholders.items():
         text = text.replace(html_mod.escape(key), tag)
+    for key, block in code_blocks.items():
+        text = text.replace(html_mod.escape(key), block)
 
-    # Convert Markdown bold **text** → <b>text</b>
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    # Convert Markdown italic *text* → <i>text</i> (but not inside <b> tags)
-    text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<i>\1</i>', text)
-    # Convert _italic_ → <i>italic</i>
-    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<i>\1</i>', text)
-    # Convert `code` → <code>code</code>
-    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-    # Convert ### headers → bold line
+    # ── 5. Markdown → HTML conversions (order matters!) ────────────────
+    # Inline code  `code`
+    text = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', text)
+    # Bold-italic  ***text***
+    text = re.sub(r'\*{3}(.+?)\*{3}', r'<b><i>\1</i></b>', text, flags=re.DOTALL)
+    # Bold  **text**
+    text = re.sub(r'\*{2}(.+?)\*{2}', r'<b>\1</b>', text, flags=re.DOTALL)
+    # Italic  *text*  (only within a single line; [^\n*] avoids crossing bullets)
+    text = re.sub(r'(?<!\w)\*([^\n*]+?)\*(?!\w)', r'<i>\1</i>', text)
+    # Italic  _text_
+    text = re.sub(r'(?<!\w)_([^\n_]+?)_(?!\w)', r'<i>\1</i>', text)
+    # Bold  __text__
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
+    # Headers  ### text
     text = re.sub(r'^#{1,3}\s*(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    # Links  [text](url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+
+    # ── 6. Last-resort cleanup: strip stray lone formatting asterisks ──
+    #   A line that is JUST a stray "*" or "**"
+    text = re.sub(r'^\*{1,3}\s*$', '', text, flags=re.MULTILINE)
 
     return text
 
@@ -460,11 +490,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mentions_psychology(user_text) and "/psychology" not in answer:
             answer += PSYCHOLOGY_FOOTER
 
-        # Cache the response
-        response_cache.put(user_text, answer)
-
-        # Sanitize any stray Markdown into HTML
+        # Sanitize Markdown → HTML *before* caching so cache always stores clean HTML
         answer = sanitize_for_html(answer)
+
+        # Cache the sanitized response
+        response_cache.put(user_text, answer)
 
         await _send_reply(update, answer)
 
