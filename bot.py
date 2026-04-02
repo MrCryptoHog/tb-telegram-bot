@@ -32,6 +32,14 @@ from telegram.ext import (
 
 from providers import ProviderManager
 from rate_limiter import RateLimiter
+from tradingview import (
+    extract_symbol,
+    extract_interval,
+    fetch_tradingview_ta,
+    format_tradingview_context,
+    is_ta_request,
+    get_supported_symbols_text,
+)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -168,6 +176,22 @@ of the question. You MUST:\
   • Give actionable observations (e.g., "volume declining = fading interest")\
   NEVER say "I don't have access to live data" when this block is present.\
   Remind them this is a point-in-time snapshot, not live monitoring, and DYOR.
+
+10. **TradingView Technical Analysis (IMPORTANT)** – When the message contains a \
+"=== LIVE TRADINGVIEW TECHNICAL ANALYSIS ===" block, you MUST provide a \
+detailed technical analysis using the real indicator data provided. This data \
+is fetched live from TradingView at the moment of the question. You MUST:\
+  • State the asset, timeframe, and current price right away\
+  • Interpret the overall recommendation (BUY/SELL/NEUTRAL) and signal counts\
+  • Analyze RSI: overbought (>70), oversold (<30), or neutral territory\
+  • Analyze MACD: bullish/bearish crossover, histogram direction\
+  • Analyze moving averages: price vs EMA/SMA 20/50/200, golden/death cross\
+  • Note Bollinger Band position (near upper = overbought, near lower = oversold)\
+  • Note ADX for trend strength (>25 = strong trend, <20 = ranging)\
+  • Mention key pivot levels as support/resistance\
+  • Summarize with 2-3 actionable takeaways\
+  NEVER say "I don't have access to live data" when this block is present.\
+  This is a real-time snapshot, remind them to monitor for updates and DYOR.
 """
 
 
@@ -591,10 +615,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(OFF_TOPIC_REPLY, parse_mode="HTML")
         return
 
-    # ── Check cache first (costs zero rate limit!) ──
-    # Skip cache for DexScreener URLs — data changes in real time
+    # ── Detect live-data requests (skip cache for these) ──
     has_dex_url = bool(extract_dexscreener_urls(user_text))
-    if not has_dex_url:
+    tv_symbol = extract_symbol(user_text)
+    has_live_data = has_dex_url or (tv_symbol and is_ta_request(user_text))
+
+    # ── Check cache first (costs zero rate limit!) ──
+    # Skip cache for live-data requests (DexScreener, TradingView)
+    if not has_live_data:
         cached = response_cache.get(user_text)
         if cached:
             logger.info("Cache hit — serving cached response (no rate limit used)")
@@ -631,12 +659,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           "Acknowledge the link and offer general guidance.]")
             logger.warning("DexScreener returned no data for %s/%s", chain, pair_addr)
 
+    # ── Check for TradingView TA request → fetch live indicators ──
+    tv_context = ""
+    if tv_symbol and is_ta_request(user_text):
+        interval = extract_interval(user_text)
+        logger.info("TradingView TA request: %s (%s)", tv_symbol.display_name, interval)
+        tv_data = fetch_tradingview_ta(tv_symbol, interval)
+        if tv_data:
+            tv_context = "\n\n" + format_tradingview_context(tv_symbol, interval, tv_data)
+            logger.info("TradingView data fetched for %s (%d bytes)",
+                       tv_symbol.display_name, len(tv_context))
+        else:
+            tv_context = (f"\n\n[Note: User asked for TA on {tv_symbol.display_name} "
+                         f"but TradingView returned no data. Acknowledge the request "
+                         f"and provide general TA guidance.]")
+            logger.warning("TradingView returned no data for %s", tv_symbol.symbol)
+
     # ── Query AI with multi-provider fallback ──
-    prompt = f"[Group member {user_name} asks]: {user_text}{dex_context}"
+    live_context = dex_context + tv_context
+    prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
 
     try:
         # Use more tokens for chart analysis (data-heavy responses)
-        tokens = 1200 if dex_context else 800
+        tokens = 1200 if live_context else 800
         answer, provider_name = await provider_mgr.generate(
             system_prompt=SYSTEM_PROMPT,
             user_message=prompt,
