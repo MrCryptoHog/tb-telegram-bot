@@ -209,31 +209,38 @@ PSYCHOLOGY_FOOTER = (
 
 def sanitize_for_html(text: str) -> str:
     """
-    Bullet-proof Markdown → Telegram-HTML converter.
-    Handles: bullet lists, ```code blocks```, `inline code`, ***bold-italic***,
-    **bold**, *italic*, _italic_, __bold__, ###headers, [links](url).
-    Also escapes bare HTML so Telegram's parser never chokes.
+    Aggressive Markdown → Telegram-HTML converter.
+    Converts what it can, then *strips* any surviving formatting markers
+    so raw asterisks / underscores never reach the user.
     """
     import html as html_mod
     import uuid
 
-    # ── 0. Convert bullet-point asterisks BEFORE anything else ──────────
-    #   "* item"  →  "• item"   (prevents confusion with italic markers)
+    # ── 0. Bullet-point asterisks → • (before italic regex eats them) ──
     text = re.sub(r'^\s*\*\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*-\s+', '• ', text, flags=re.MULTILINE)
 
-    # ── 1. Stash fenced code blocks so nothing inside gets mangled ──────
+    # ── 1. Stash fenced code blocks ────────────────────────────────────
     code_blocks: dict[str, str] = {}
 
     def stash_code_block(m):
-        key = f'__CODEBLOCK_{uuid.uuid4().hex[:8]}__'
-        # Keep content, escape HTML inside it
+        key = f'__CB_{uuid.uuid4().hex[:8]}__'
         code_blocks[key] = f'<pre>{html_mod.escape(m.group(2))}</pre>'
         return key
 
-    text = re.sub(r'```(\w*)\n?([\s\S]*?)```', stash_code_block, text)
+    text = re.sub(r'```(?:\w*)\n?([\s\S]*?)```', stash_code_block, text)
 
-    # ── 2. Preserve any existing valid HTML tags ────────────────────────
+    # ── 2. Stash inline code `…` ──────────────────────────────────────
+    inline_codes: dict[str, str] = {}
+
+    def stash_inline_code(m):
+        key = f'__IC_{uuid.uuid4().hex[:8]}__'
+        inline_codes[key] = f'<code>{html_mod.escape(m.group(1))}</code>'
+        return key
+
+    text = re.sub(r'`([^`\n]+)`', stash_inline_code, text)
+
+    # ── 3. Preserve existing valid HTML tags ───────────────────────────
     placeholders: dict[str, str] = {}
     allowed_tags = ['b', 'i', 'code', 'pre', 'u', 's', 'a']
     tag_pattern = re.compile(
@@ -242,42 +249,55 @@ def sanitize_for_html(text: str) -> str:
     )
 
     def save_tag(m):
-        key = f'__TAG_{uuid.uuid4().hex[:8]}__'
+        key = f'__TG_{uuid.uuid4().hex[:8]}__'
         placeholders[key] = m.group(0)
         return key
 
     text = tag_pattern.sub(save_tag, text)
 
-    # ── 3. Escape HTML-special characters (&, <, >) ────────────────────
+    # ── 4. Escape HTML-special characters ──────────────────────────────
     text = html_mod.escape(text)
 
-    # ── 4. Restore stashed tags & code blocks ──────────────────────────
-    for key, tag in placeholders.items():
-        text = text.replace(html_mod.escape(key), tag)
-    for key, block in code_blocks.items():
-        text = text.replace(html_mod.escape(key), block)
+    # ── 5. Restore all stashed content ─────────────────────────────────
+    for key, val in placeholders.items():
+        text = text.replace(html_mod.escape(key), val)
+    for key, val in code_blocks.items():
+        text = text.replace(html_mod.escape(key), val)
+    for key, val in inline_codes.items():
+        text = text.replace(html_mod.escape(key), val)
 
-    # ── 5. Markdown → HTML conversions (order matters!) ────────────────
-    # Inline code  `code`
-    text = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', text)
-    # Bold-italic  ***text***
-    text = re.sub(r'\*{3}(.+?)\*{3}', r'<b><i>\1</i></b>', text, flags=re.DOTALL)
-    # Bold  **text**
-    text = re.sub(r'\*{2}(.+?)\*{2}', r'<b>\1</b>', text, flags=re.DOTALL)
-    # Italic  *text*  (only within a single line; [^\n*] avoids crossing bullets)
-    text = re.sub(r'(?<!\w)\*([^\n*]+?)\*(?!\w)', r'<i>\1</i>', text)
-    # Italic  _text_
-    text = re.sub(r'(?<!\w)_([^\n_]+?)_(?!\w)', r'<i>\1</i>', text)
-    # Bold  __text__
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
+    # ── 6. Markdown → HTML (single-line only, safe patterns) ──────────
     # Headers  ### text
     text = re.sub(r'^#{1,3}\s*(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
-    # Links  [text](url)
+    # Bold-italic ***text***
+    text = re.sub(r'\*{3}(.+?)\*{3}', r'<b><i>\1</i></b>', text)
+    # Bold **text**  (single-line only — no DOTALL!)
+    text = re.sub(r'\*{2}(.+?)\*{2}', r'<b>\1</b>', text)
+    # Italic *text* (single-line, no asterisks inside)
+    text = re.sub(r'(?<!\w)\*([^\n*]+?)\*(?!\w)', r'<i>\1</i>', text)
+    # Bold __text__
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    # Italic _text_ (single-line, no underscores inside)
+    text = re.sub(r'(?<!\w)_([^\n_]+?)_(?!\w)', r'<i>\1</i>', text)
+    # Links [text](url)
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
 
-    # ── 6. Last-resort cleanup: strip stray lone formatting asterisks ──
-    #   A line that is JUST a stray "*" or "**"
+    # ── 7. NUCLEAR CLEANUP: strip any surviving formatting markers ─────
+    #   This ensures NO raw asterisks or underscores from Markdown ever
+    #   reach the user. Targets only formatting positions, not math (5 * 3).
+    #
+    #   Opening markers:  whitespace/start + ***/** /*  + word-char
+    text = re.sub(r'(?<=\s)\*{1,3}(?=\w)', '', text)
+    text = re.sub(r'^\*{1,3}(?=\w)', '', text, flags=re.MULTILINE)
+    #   Closing markers:  word-char/punct + ***/** /*  + whitespace/punct/end
+    text = re.sub(r'(?<=[\w.,;:!?)])\*{1,3}(?=[\s.,;:!?)\]\}]|$)', '', text, flags=re.MULTILINE)
+    #   Standalone lone asterisks on a line
     text = re.sub(r'^\*{1,3}\s*$', '', text, flags=re.MULTILINE)
+
+    #   Same for underscores used as formatting (opening/closing)
+    text = re.sub(r'(?<=\s)_{1,2}(?=\w)', '', text)
+    text = re.sub(r'^_{1,2}(?=\w)', '', text, flags=re.MULTILINE)
+    text = re.sub(r'(?<=[\w.,;:!?)])_{1,2}(?=[\s.,;:!?)\]\}]|$)', '', text, flags=re.MULTILINE)
 
     return text
 
