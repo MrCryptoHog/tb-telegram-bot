@@ -36,7 +36,9 @@ from providers import ProviderManager
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyTB")  # without the @
+BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyTB_bot")  # without the @
+WEBHOOK_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", os.getenv("WEBHOOK_URL", ""))
+PORT = int(os.getenv("PORT", "8080"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your .env or Railway env vars.")
@@ -324,8 +326,21 @@ def main():
         )
     )
 
-    logger.info("TB is live and listening for @mentions. Let's go! 🚀")
-    app.run_polling(drop_pending_updates=True)
+    # Use webhook mode on Railway (has RAILWAY_PUBLIC_DOMAIN),
+    # fall back to polling for local development.
+    if WEBHOOK_URL:
+        webhook_full = f"https://{WEBHOOK_URL}/webhook"
+        logger.info("Starting in WEBHOOK mode → %s", webhook_full)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="/webhook",
+            webhook_url=webhook_full,
+            drop_pending_updates=True,
+        )
+    else:
+        logger.info("No WEBHOOK_URL set — starting in POLLING mode (local dev)")
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
