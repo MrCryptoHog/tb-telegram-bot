@@ -211,15 +211,52 @@ You MUST:\
 # ── DexScreener integration (free API, no key needed) ───────────────────────
 
 # Regex to match DexScreener URLs and extract chain + pair address
+# Supports both EVM (0x...) and Solana/base58 addresses in URLs
 DEXSCREENER_URL_PATTERN = re.compile(
-    r'https?://(?:www\.)?dexscreener\.com/([\w-]+)/(0x[a-fA-F0-9]{40})',
+    r'https?://(?:www\.)?dexscreener\.com/([\w-]+)/([a-zA-Z0-9]{20,})',
     re.IGNORECASE,
+)
+
+# ── Raw contract address detection ──────────────────────────────────────────
+# EVM: 0x followed by 40 hex chars
+CONTRACT_EVM_PATTERN = re.compile(r'\b(0x[a-fA-F0-9]{40})\b')
+# Solana/base58: 32-44 chars of base58 alphabet (no 0, O, I, l)
+# Negative lookbehind/ahead for URL chars to avoid matching inside URLs
+CONTRACT_SOL_PATTERN = re.compile(
+    r'(?<![/\w])([1-9A-HJ-NP-Za-km-z]{32,44})(?![/\w])'
 )
 
 
 def extract_dexscreener_urls(text: str) -> list[tuple[str, str]]:
     """Extract (chain, pair_address) tuples from DexScreener URLs in text."""
     return DEXSCREENER_URL_PATTERN.findall(text)
+
+
+def extract_contract_address(text: str) -> str | None:
+    """
+    Extract a raw contract address from the text (not inside a URL).
+    Returns the address string, or None if not found.
+    Checks for EVM (0x...) and Solana (base58) addresses.
+    """
+    # Remove DexScreener URLs first to avoid double-matching
+    cleaned = DEXSCREENER_URL_PATTERN.sub('', text)
+
+    # Check EVM first (unambiguous thanks to 0x prefix)
+    m = CONTRACT_EVM_PATTERN.search(cleaned)
+    if m:
+        return m.group(1)
+
+    # Check Solana-style base58 — require mixed case to avoid false positives
+    m = CONTRACT_SOL_PATTERN.search(cleaned)
+    if m:
+        candidate = m.group(1)
+        has_upper = any(c.isupper() for c in candidate)
+        has_lower = any(c.islower() for c in candidate)
+        has_digit = any(c.isdigit() for c in candidate)
+        if (has_upper and has_lower) or (has_digit and (has_upper or has_lower)):
+            return candidate
+
+    return None
 
 
 async def fetch_dexscreener_data(chain: str, pair_address: str) -> dict | None:
@@ -246,6 +283,31 @@ async def fetch_dexscreener_data(chain: str, pair_address: str) -> dict | None:
     except Exception as exc:
         logger.warning("DexScreener API error for %s/%s: %s", chain, pair_address, exc)
         return None
+
+
+async def fetch_dexscreener_by_token(token_address: str) -> tuple[dict | None, str | None, str | None]:
+    """
+    Look up a raw contract address on DexScreener's token endpoint.
+    Returns (pair_data, chain, pair_address) or (None, None, None).
+    Picks the highest-liquidity pair when multiple exist.
+    """
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            pairs = data.get("pairs") or []
+            if not pairs:
+                return None, None, None
+            # Pick the highest-liquidity pair
+            best = max(pairs, key=lambda p: (p.get("liquidity", {}).get("usd") or 0))
+            chain_id = best.get("chainId", "unknown")
+            pair_addr = best.get("pairAddress", token_address)
+            return best, chain_id, pair_addr
+    except Exception as exc:
+        logger.warning("DexScreener token lookup error for %s: %s", token_address, exc)
+        return None, None, None
 
 
 def format_dexscreener_context(pair: dict) -> str:
@@ -542,11 +604,14 @@ def is_on_topic(text: str) -> bool:
     Return True if the message is related to trading/crypto/finance.
     Very short messages (greetings) are treated as on-topic to avoid
     false-rejecting things like 'thanks' or 'hi'.
-    DexScreener URLs are always on-topic.
+    DexScreener URLs and contract addresses are always on-topic.
     """
     cleaned = text.strip()
     # DexScreener / chart URLs are always on-topic
     if DEXSCREENER_URL_PATTERN.search(cleaned):
+        return True
+    # Raw contract addresses are always on-topic
+    if extract_contract_address(cleaned):
         return True
     # Let very short messages through (greetings, follow-ups)
     if len(cleaned.split()) <= 3:
@@ -633,12 +698,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Detect live-data requests (skip cache for these) ──
     has_dex_url = bool(extract_dexscreener_urls(user_text))
+    raw_ca = extract_contract_address(user_text)
+    has_raw_ca = bool(raw_ca)
     tv_symbol = extract_symbol(user_text)
-    has_live_data = has_dex_url or (tv_symbol and is_ta_request(user_text))
+    has_live_data = has_dex_url or has_raw_ca or (tv_symbol and is_ta_request(user_text))
 
     if has_live_data:
-        logger.info("Live-data request detected — cache bypassed (dex=%s, tv=%s)",
-                     has_dex_url, tv_symbol.display_name if tv_symbol else None)
+        logger.info("Live-data request detected — cache bypassed (dex=%s, ca=%s, tv=%s)",
+                     has_dex_url, raw_ca,
+                     tv_symbol.display_name if tv_symbol else None)
 
     # ── Check cache first (costs zero rate limit!) ──
     # Skip cache for live-data requests (DexScreener, TradingView)
@@ -662,7 +730,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action=chat_action
     )
 
-    # ── Check for DexScreener URLs → fetch live data ──
+    # ── Check for DexScreener URLs OR raw contract addresses → fetch live data ──
     dex_context = ""
     chain = pair_addr = None
     dex_urls = extract_dexscreener_urls(user_text) if has_dex_url else []
@@ -680,6 +748,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           "the API returned no data for this pair. "
                           "Acknowledge the link and offer general guidance.]")
             logger.warning("DexScreener returned no data for %s/%s", chain, pair_addr)
+    elif raw_ca:
+        logger.info("Raw contract address detected: %s — looking up on DexScreener", raw_ca)
+        pair_data, chain, pair_addr = await fetch_dexscreener_by_token(raw_ca)
+        if pair_data:
+            dex_context = "\n\n" + format_dexscreener_context(pair_data)
+            token_name = pair_data.get("baseToken", {}).get("symbol", "token")
+            logger.info("DexScreener data fetched for %s via token lookup (%d bytes)",
+                       token_name, len(dex_context))
+        else:
+            dex_context = ("\n\n[Note: User shared a contract address but "
+                          "DexScreener returned no data for this token. "
+                          "Acknowledge the address and offer general guidance.]")
+            logger.warning("DexScreener returned no data for token %s", raw_ca)
 
     # ── Check for TradingView TA request → fetch live indicators + chart ──
     tv_context = ""
@@ -735,14 +816,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Chart responses must fit in 1024-char Telegram caption → fewer tokens.
         has_chart = bool(
             (tv_symbol and is_ta_request(user_text) and interval)
-            or (has_dex_url and chain and pair_addr)
+            or ((has_dex_url or has_raw_ca) and chain and pair_addr)
         )
         tokens = 500 if has_chart else (1200 if live_context else 800)
 
         # ── Determine if we should capture a DexScreener screenshot ──
         # (TradingView screenshots are already captured above with the TA data)
         dex_screenshot_coro = None
-        if has_dex_url and chain and pair_addr and not chart_image:
+        if (has_dex_url or has_raw_ca) and chain and pair_addr and not chart_image:
             dex_screenshot_coro = screenshot_dexscreener_chart(chain, pair_addr)
 
         # ── Run AI call (+ DexScreener screenshot in parallel if applicable) ──
