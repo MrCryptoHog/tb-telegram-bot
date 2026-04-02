@@ -102,12 +102,17 @@ identification, probability-based thinking, expectancy.
 
 ## Rules you MUST follow
 
-1. **Educational only** – You do NOT have access to live market data. \
-If someone asks for a current price, live chart, or real-time data, \
-politely explain: "I don't have access to live prices – we have other \
-tools in the group for that! But I'd love to help you think through \
-strategy, analysis, or risk management on that asset. What specifically \
-are you working on?"
+1. **Educational only** – By default you do NOT have access to live market data. \
+If someone asks for a current price, live chart, or real-time data AND no \
+live token data block is provided below their message, politely explain: \
+"I don't have access to live prices – we have other tools in the group for \
+that! But I'd love to help you think through strategy, analysis, or risk \
+management on that asset. What specifically are you working on?"\
+\
+HOWEVER: If the message includes a data block starting with \
+"=== LIVE TOKEN DATA ===" then you DO have real data to work with. \
+In that case, NEVER say you lack live data. Instead, analyze the provided \
+data thoroughly using Rule 9.
 
 2. **Strategy-focused** – Always steer conversations toward actionable \
 learning: refining strategy, improving risk management, understanding \
@@ -150,16 +155,19 @@ tags, NOT Markdown. Use these tags:\
   Use line breaks and <b>bold headers</b> to structure answers.\
   Bullet points with • or numbered lists are fine as plain text.
 
-9. **Chart / Token Analysis** – When the user provides live token data \
-(price, volume, liquidity, price changes, etc.), you DO have data to work with. \
-Provide a concise technical analysis based on the numbers given. Cover:\
-  • Current price action & momentum (based on 5m/1h/6h/24h changes)\
-  • Volume analysis (buy vs sell pressure if available)\
-  • Liquidity assessment\
-  • Key observations (rapid price moves, unusual volume, market cap vs FDV)\
-  • Risk factors & what to watch for\
-  Always remind them this is based on a snapshot in time, not live monitoring, \
-and that they should DYOR.
+9. **Chart / Token Analysis (IMPORTANT)** – When the message contains a \
+"=== LIVE TOKEN DATA ===" block, you MUST use that data to provide a real \
+technical analysis. This data is fetched live from DexScreener at the moment \
+of the question. You MUST:\
+  • State the token name, price, and chain right away\
+  • Analyze momentum based on 5m/1h/6h/24h price changes\
+  • Assess volume (is it healthy relative to liquidity? buy vs sell ratio?)\
+  • Evaluate liquidity (is it sufficient? any rug-pull red flags?)\
+  • Note market cap vs FDV (unlocked supply risk?)\
+  • Highlight risk factors specific to this token\
+  • Give actionable observations (e.g., "volume declining = fading interest")\
+  NEVER say "I don't have access to live data" when this block is present.\
+  Remind them this is a point-in-time snapshot, not live monitoring, and DYOR.
 """
 
 
@@ -224,6 +232,7 @@ def format_dexscreener_context(pair: dict) -> str:
 
     lines = [
         f"=== LIVE TOKEN DATA (from DexScreener) ===",
+        f"IMPORTANT: This is REAL live data fetched just now. Analyze it using Rule 9.",
         f"Token: {base.get('name', '?')} ({base.get('symbol', '?')})",
         f"Pair: {base.get('symbol', '?')}/{quote.get('symbol', '?')}",
         f"Chain: {pair.get('chainId', '?')}",
@@ -583,11 +592,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Check cache first (costs zero rate limit!) ──
-    cached = response_cache.get(user_text)
-    if cached:
-        logger.info("Cache hit — serving cached response (no rate limit used)")
-        await _send_reply(update, cached)
-        return
+    # Skip cache for DexScreener URLs — data changes in real time
+    has_dex_url = bool(extract_dexscreener_urls(user_text))
+    if not has_dex_url:
+        cached = response_cache.get(user_text)
+        if cached:
+            logger.info("Cache hit — serving cached response (no rate limit used)")
+            await _send_reply(update, cached)
+            return
 
     # ── Rate limit check (only for non-cached / actual API calls) ──
     allowed, denial_msg = rate_limiter.check(user_id, user_name)
@@ -603,7 +615,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Check for DexScreener URLs → fetch live data ──
     dex_context = ""
-    dex_urls = extract_dexscreener_urls(user_text)
+    dex_urls = extract_dexscreener_urls(user_text) if has_dex_url else []
     if dex_urls:
         chain, pair_addr = dex_urls[0]  # Use first URL found
         logger.info("DexScreener URL detected: %s/%s — fetching data", chain, pair_addr)
@@ -623,10 +635,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = f"[Group member {user_name} asks]: {user_text}{dex_context}"
 
     try:
+        # Use more tokens for chart analysis (data-heavy responses)
+        tokens = 1200 if dex_context else 800
         answer, provider_name = await provider_mgr.generate(
             system_prompt=SYSTEM_PROMPT,
             user_message=prompt,
-            max_tokens=800,  # Keep concise to save rate limits
+            max_tokens=tokens,
         )
 
         logger.info("Response from %s (%d chars)", provider_name, len(answer))
