@@ -121,9 +121,10 @@ that! But I'd love to help you think through strategy, analysis, or risk \
 management on that asset. What specifically are you working on?"\
 \
 HOWEVER: If the message includes a data block starting with \
-"=== LIVE TOKEN DATA ===" then you DO have real data to work with. \
-In that case, NEVER say you lack live data. Instead, analyze the provided \
-data thoroughly using Rule 9.
+"=== LIVE TOKEN DATA ===" or "=== LIVE TRADINGVIEW TECHNICAL ANALYSIS ===" \
+then you DO have real data to work with. \
+In that case, NEVER say you lack live data. NEVER mention the data block \
+name to the user — just analyze the data directly using Rule 9 or Rule 10.
 
 2. **Strategy-focused** – Always steer conversations toward actionable \
 learning: refining strategy, improving risk management, understanding \
@@ -169,7 +170,10 @@ tags, NOT Markdown. Use these tags:\
 9. **Chart / Token Analysis (IMPORTANT)** – When the message contains a \
 "=== LIVE TOKEN DATA ===" block, you MUST use that data to provide a real \
 technical analysis. This data is fetched live from DexScreener at the moment \
-of the question. You MUST:\
+of the question. Users often paste just a contract address (CA) with no \
+additional text — treat that as an implicit request for token analysis. \
+NEVER tell the user you need a "LIVE TOKEN DATA block" — that's an internal \
+mechanism. If the block is present, just analyze the data. You MUST:\
   • State the token name, price, and chain right away\
   • Analyze momentum based on 5m/1h/6h/24h price changes\
   • Assess volume (is it healthy relative to liquidity? buy vs sell ratio?)\
@@ -757,9 +761,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("DexScreener data fetched for %s via token lookup (%d bytes)",
                        token_name, len(dex_context))
         else:
-            dex_context = ("\n\n[Note: User shared a contract address but "
-                          "DexScreener returned no data for this token. "
-                          "Acknowledge the address and offer general guidance.]")
+            dex_context = (f"\n\n[Note: User shared contract address {raw_ca} but "
+                          f"DexScreener returned no data. This could mean the token "
+                          f"is very new, unlisted, or the address is invalid. "
+                          f"Let the user know the token wasn't found on DexScreener "
+                          f"and suggest they double-check the address or try again later.]")
             logger.warning("DexScreener returned no data for token %s", raw_ca)
 
     # ── Check for TradingView TA request → fetch live indicators + chart ──
@@ -810,7 +816,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Query AI with multi-provider fallback ──
     live_context = dex_context + tv_context
-    prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
+
+    # When user just pastes a raw CA, enrich the prompt so the AI knows
+    # they want token analysis (not just "what is this address?")
+    effective_text = user_text
+    if raw_ca and dex_context and "LIVE TOKEN DATA" in dex_context:
+        effective_text = (f"{user_text}\n\n"
+                         f"[The user pasted a contract address. "
+                         f"Analyze the live token data below as a token analysis request.]")
+
+    prompt = f"[Group member {user_name} asks]: {effective_text}{live_context}"
 
     try:
         # Chart responses must fit in 1024-char Telegram caption → fewer tokens.
