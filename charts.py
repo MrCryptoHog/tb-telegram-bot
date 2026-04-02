@@ -181,17 +181,25 @@ async def screenshot_dexscreener_chart(
         page = await browser.new_page(viewport={"width": width, "height": height})
 
         url = f"https://dexscreener.com/{chain}/{pair_address}"
-        await page.goto(url, wait_until="networkidle", timeout=25_000)
+        # Use "load" instead of "networkidle" — DexScreener's WebSocket
+        # streams keep the network busy indefinitely, causing networkidle
+        # to always timeout.  "load" fires once the page + resources load,
+        # then we give the chart JS a few seconds to render.
+        await page.goto(url, wait_until="load", timeout=15_000)
 
         # Dismiss cookie / permission banners
         for btn_text in ["Accept", "Got it", "Close", "OK", "I understand"]:
             try:
-                await page.click(f'button:has-text("{btn_text}")', timeout=1_500)
+                await page.click(f'button:has-text("{btn_text}")', timeout=1_000)
             except Exception:
                 pass
 
-        # Wait for chart to render
-        await page.wait_for_timeout(4_000)
+        # Wait for the chart canvas to appear, then extra render time
+        try:
+            await page.wait_for_selector("canvas", timeout=8_000)
+        except Exception:
+            logger.warning("DexScreener canvas not found, using timed wait")
+        await page.wait_for_timeout(3_000)
 
         screenshot = await page.screenshot(type="png")
         await page.close()
