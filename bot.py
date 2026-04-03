@@ -34,7 +34,7 @@ from telegram.ext import (
 
 from providers import ProviderManager
 from rate_limiter import RateLimiter
-from charts import screenshot_tradingview_chart, generate_dex_chart
+from charts import screenshot_tradingview_chart, generate_dex_chart, analyze_1m_wicks
 from tradingview import (
     extract_symbol,
     extract_interval,
@@ -154,7 +154,16 @@ our dedicated quiz bot's 10-question test and get your score out of 10!"
 7. **Stay on topic** – If someone asks something completely unrelated to \
 trading, investing, finance, or crypto, gently redirect: "That's a bit \
 outside my wheelhouse! I'm here to help with trading, crypto, and market \
-strategy questions. What can I help you with on that front?"
+strategy questions. What can I help you with on that front?"\
+\
+HOWEVER: Questions about market hours, trading schedules, holidays \
+(bank holidays, Easter, Christmas, etc.), session times, or whether \
+markets are open/closed on specific days are ALWAYS on-topic. These \
+are essential trading logistics. Answer them directly and helpfully. \
+You know standard market hours: NYSE/NASDAQ 9:30-16:00 ET (Mon-Fri), \
+Forex 24/5 (Sun 17:00-Fri 17:00 ET), crypto 24/7. You also know \
+common market holidays (Good Friday, Easter Monday for UK/EU, \
+US federal holidays, etc.). Answer confidently.
 
 8. **Telegram HTML formatting** – You MUST format replies using Telegram HTML \
 tags, NOT Markdown. Use these tags:\
@@ -167,20 +176,31 @@ tags, NOT Markdown. Use these tags:\
   Use line breaks and <b>bold headers</b> to structure answers.\
   Bullet points with • or numbered lists are fine as plain text.
 
-9. **Chart / Token Analysis (IMPORTANT)** – When the message contains a \
-"=== LIVE TOKEN DATA ===" block, you MUST use that data to provide a real \
-technical analysis. This data is fetched live from DexScreener at the moment \
-of the question. NEVER mention "LIVE TOKEN DATA", "data block", or any \
+9. **Chart / Token Analysis — DEGEN FOCUS (IMPORTANT)** – When the message \
+contains a "=== LIVE TOKEN DATA ===" block, you MUST use that data to provide \
+a real analysis. This data is fetched live from DexScreener at the moment \
+of the question. Most tokens shared here are degen/micro-cap plays. \
+NEVER mention "LIVE TOKEN DATA", "data block", "wick analysis", or any \
 internal mechanism to the user — just analyze the data directly. \
 If the block is present, it means we successfully looked up their token. \
-You MUST:\
-  • State the token name, price, and chain right away\
-  • Analyze momentum based on 5m/1h/6h/24h price changes\
-  • Assess volume (is it healthy relative to liquidity? buy vs sell ratio?)\
-  • Evaluate liquidity (is it sufficient? any rug-pull red flags?)\
-  • Note market cap vs FDV (unlocked supply risk?)\
-  • Highlight risk factors specific to this token\
-  • Give actionable observations (e.g., "volume declining = fading interest")\
+You MUST focus on these KEY METRICS for degen plays:\
+  • <b>Market Cap</b>: State it clearly. Then estimate realistic X potential — \
+    e.g. "At $500K mcap, a 10x to $5M is possible if volume sustains, but \
+    50x+ would need major catalyst." Compare to similar tokens that have run.\
+  • <b>Volume</b>: Is 24h volume healthy vs mcap? (>30% of mcap = hot, \
+    <5% = dead). Buy:sell ratio — who's in control?\
+  • <b>Liquidity</b>: Is it sufficient? Low liq + high mcap = dangerous.\
+  • <b>Holder Count</b>: If holder data is provided, analyze distribution. \
+    <200 holders = extremely early/risky. 500-2000 = growing. 5000+ = established.\
+  • <b>1-Minute Wick Analysis</b>: If a WICK ANALYSIS section is provided, \
+    use it! Consecutive upper wicks on the 1m = sellers taking profit / \
+    distribution in progress. This is a KEY red flag for entries. \
+    Consecutive lower wicks = buyers absorbing dips (accumulation). \
+    Report what the wick data shows and what it means for the trade.\
+  • <b>X Potential Estimate</b>: ALWAYS give a realistic X estimate from \
+    current mcap with reasoning. Consider: volume trend, liquidity depth, \
+    how old the token is (pair created date), and momentum.\
+  • Highlight rug-pull red flags: low liq, mcap/fdv mismatch, dying volume.\
   NEVER say "I don't have access to live data" when this block is present.\
   Remind them this is a point-in-time snapshot, not live monitoring, and DYOR.\
   CRITICAL: Your entire response MUST be under 900 characters. A chart image \
@@ -598,6 +618,14 @@ ON_TOPIC_KEYWORDS = re.compile(
     r"invest|profit|loss|pnl|p&l|roi|return|compound|dca|"
     r"dollar.?cost|buy|sell|accumulate|allocat|rebalanc|"
     r"fundamentals|valuation|earnings|revenue|"
+    # Market schedule / holidays (on-topic — traders need to know)
+    r"market.?open|market.?close|market.?hour|trading.?hour|session|"
+    r"pre.?market|after.?hour|holiday|bank.?holiday|easter|christmas|"
+    r"new.?year|thanks.?giving|memorial.?day|labor.?day|independence|"
+    r"good.?friday|monday|tuesday|wednesday|thursday|friday|"
+    r"weekend|tomorrow|today|open.?tomorrow|closed.?tomorrow|"
+    r"nyse|london|tokyo|sydney|asian.?session|london.?session|"
+    r"us.?session|new.?york.?session|exchange.?hours|"
     # Common question patterns about the above
     r"price.?action|pa|money.?management|mm|"
     r"technical|analysis|signal|setup|confluenc"
@@ -800,6 +828,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           f"and suggest they double-check the address or try again later.]")
             logger.warning("DexScreener returned no data for token %s", raw_ca)
 
+    # ── Fetch 1-minute wick analysis for degen tokens (parallel-safe) ──
+    wick_context = ""
+    if chain and pair_addr and dex_context:
+        try:
+            wick_data = await analyze_1m_wicks(chain, pair_addr)
+            if wick_data:
+                wick_context = "\n\n" + wick_data
+                logger.info("Wick analysis attached (%d bytes)", len(wick_context))
+        except Exception as exc:
+            logger.warning("Wick analysis error (non-fatal): %s", exc)
+
     # ── Check for TradingView TA request → fetch live indicators + chart ──
     tv_context = ""
     interval = None
@@ -847,7 +886,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("TradingView returned no data for %s", tv_symbol.symbol)
 
     # ── Query AI with multi-provider fallback ──
-    live_context = dex_context + tv_context
+    live_context = dex_context + wick_context + tv_context
 
     prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
 

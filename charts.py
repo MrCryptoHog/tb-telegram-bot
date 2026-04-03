@@ -1,11 +1,14 @@
 """
-Chart module — generates candlestick chart images.
+Chart module — generates candlestick chart images + wick analysis.
 
 TradingView charts: Playwright screenshots of widget embeds (works great).
 DEX token charts:   Generated via mplfinance from GeckoTerminal OHLCV API
                     data (Playwright screenshots of GT embeds fail because
                     the TradingView widget inside them doesn't render candle
                     data in headless Chromium).
+1-Min Wick Analysis: Fetches 1m OHLCV from GeckoTerminal and detects
+                     consecutive upper/lower wicks indicating TP or
+                     accumulation patterns.
 
 Browser instance is shared (singleton) and lazily launched on first use.
 """
@@ -323,6 +326,174 @@ async def generate_dex_chart(
 
     except Exception as exc:
         logger.error("DEX chart generation failed (%s/%s): %s", chain, pair_address, exc)
+        return None
+
+
+# ── 1-Minute Wick Analysis ───────────────────────────────────────────────────
+# Fetches the last 60 one-minute candles and looks for consecutive upper/lower
+# wicks that signal take-profit distribution or dip accumulation.
+
+async def analyze_1m_wicks(
+    chain: str,
+    pair_address: str,
+) -> str | None:
+    """
+    Fetch 60 x 1-minute candles from GeckoTerminal and detect consecutive
+    wick patterns that indicate TP (take-profit / selling pressure) or
+    accumulation (buying-the-dip pressure).
+
+    Returns a human-readable analysis string to inject into the AI context,
+    or None if data is unavailable / insufficient.
+    """
+    try:
+        gt_chain = _GT_CHAIN_MAP.get(chain, chain)
+        api_url = (
+            f"https://api.geckoterminal.com/api/v2/networks/{gt_chain}"
+            f"/pools/{pair_address}/ohlcv/minute"
+            f"?aggregate=1&limit=60"
+        )
+
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(api_url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        ohlcv_list = (
+            data.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+        )
+        if not ohlcv_list or len(ohlcv_list) < 10:
+            return None
+
+        # Sort chronological (oldest first)
+        ohlcv_list.sort(key=lambda c: c[0])
+
+        # Analyze each candle for wick dominance
+        # candle: [timestamp, open, high, low, close, volume]
+        upper_wick_streaks = []  # list of streak lengths
+        lower_wick_streaks = []
+        current_upper = 0
+        current_lower = 0
+        total_upper_wick = 0
+        total_lower_wick = 0
+
+        for candle in ohlcv_list:
+            _, o, h, l, c, vol = [float(x) for x in candle]
+            body = abs(c - o)
+            full_range = h - l
+
+            if full_range == 0:
+                # Flat candle — reset streaks
+                if current_upper >= 2:
+                    upper_wick_streaks.append(current_upper)
+                if current_lower >= 2:
+                    lower_wick_streaks.append(current_lower)
+                current_upper = 0
+                current_lower = 0
+                continue
+
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            wick_ratio_upper = upper_wick / full_range
+            wick_ratio_lower = lower_wick / full_range
+
+            # Significant upper wick: > 40% of candle range
+            if wick_ratio_upper > 0.40:
+                current_upper += 1
+                total_upper_wick += 1
+                if current_lower >= 2:
+                    lower_wick_streaks.append(current_lower)
+                current_lower = 0
+            # Significant lower wick: > 40% of candle range
+            elif wick_ratio_lower > 0.40:
+                current_lower += 1
+                total_lower_wick += 1
+                if current_upper >= 2:
+                    upper_wick_streaks.append(current_upper)
+                current_upper = 0
+            else:
+                # No dominant wick — save streaks
+                if current_upper >= 2:
+                    upper_wick_streaks.append(current_upper)
+                if current_lower >= 2:
+                    lower_wick_streaks.append(current_lower)
+                current_upper = 0
+                current_lower = 0
+
+        # Capture final streaks
+        if current_upper >= 2:
+            upper_wick_streaks.append(current_upper)
+        if current_lower >= 2:
+            lower_wick_streaks.append(current_lower)
+
+        # Calculate price change over the 60 candles
+        first_close = float(ohlcv_list[0][4])
+        last_close = float(ohlcv_list[-1][4])
+        pct_change = ((last_close - first_close) / first_close * 100) if first_close else 0
+
+        # Build analysis
+        n = len(ohlcv_list)
+        lines = [
+            f"=== 1-MINUTE WICK ANALYSIS (last {n} candles) ===",
+            f"Price change over period: {pct_change:+.2f}%",
+            f"Candles with significant upper wicks (TP/sell pressure): {total_upper_wick}/{n}",
+            f"Candles with significant lower wicks (buy absorption): {total_lower_wick}/{n}",
+        ]
+
+        if upper_wick_streaks:
+            max_streak = max(upper_wick_streaks)
+            lines.append(
+                f"CONSECUTIVE upper wick streaks: {upper_wick_streaks} "
+                f"(longest: {max_streak} candles in a row)"
+            )
+            if max_streak >= 4:
+                lines.append(
+                    "⚠️ HEAVY TP DETECTED: 4+ consecutive upper wicks = "
+                    "sustained selling pressure / distribution in progress"
+                )
+            elif max_streak >= 3:
+                lines.append(
+                    "⚠️ MODERATE TP SIGNALS: 3 consecutive upper wicks = "
+                    "sellers active, watch for breakdown"
+                )
+        else:
+            lines.append("No consecutive upper wick streaks detected (minimal TP)")
+
+        if lower_wick_streaks:
+            max_streak = max(lower_wick_streaks)
+            lines.append(
+                f"CONSECUTIVE lower wick streaks: {lower_wick_streaks} "
+                f"(longest: {max_streak} candles in a row)"
+            )
+            if max_streak >= 4:
+                lines.append(
+                    "🟢 STRONG ACCUMULATION: 4+ consecutive lower wicks = "
+                    "buyers absorbing every dip aggressively"
+                )
+            elif max_streak >= 3:
+                lines.append(
+                    "🟢 ACCUMULATION SIGNALS: 3 consecutive lower wicks = "
+                    "dip buyers active"
+                )
+        else:
+            lines.append("No consecutive lower wick streaks detected (no clear accumulation)")
+
+        # Overall wick dominance
+        if total_upper_wick > total_lower_wick * 1.5:
+            lines.append("OVERALL: Upper wicks dominate — sellers/TP in control")
+        elif total_lower_wick > total_upper_wick * 1.5:
+            lines.append("OVERALL: Lower wicks dominate — buyers absorbing dips")
+        else:
+            lines.append("OVERALL: Mixed wick signals — no clear dominance")
+
+        lines.append("=========================")
+
+        result = "\n".join(lines)
+        logger.info("Wick analysis complete for %s/%s: %d upper, %d lower wicks",
+                    gt_chain, pair_address[:10], total_upper_wick, total_lower_wick)
+        return result
+
+    except Exception as exc:
+        logger.warning("1m wick analysis failed (%s/%s): %s", chain, pair_address, exc)
         return None
 
 
