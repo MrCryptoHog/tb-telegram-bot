@@ -329,9 +329,77 @@ async def generate_dex_chart(
         return None
 
 
-# ── 1-Minute Wick Analysis ───────────────────────────────────────────────────
-# Fetches the last 60 one-minute candles and looks for consecutive upper/lower
-# wicks that signal take-profit distribution or dip accumulation.
+# ── 1-Minute Wick Analysis (Tops & Bottoms Detection) ───────────────────────
+# Fetches the last 60 one-minute candles and detects consecutive wick patterns
+# at similar price levels — the hallmark of tops (rejection / distribution)
+# and bottoms (absorption / accumulation).
+
+
+def _detect_wick_clusters(candles: list[dict], wick_key: str, price_key: str,
+                          threshold: float = 0.35) -> list[dict]:
+    """
+    Scan candles for clusters of consecutive significant wicks whose tip prices
+    land in a similar zone (within 1.5× average candle range), indicating a
+    top or bottom formation.
+
+    Args:
+        candles: list of {'o','h','l','c','vol','idx'} dicts
+        wick_key: 'upper' or 'lower'
+        price_key: 'h' for upper wick tips, 'l' for lower wick tips
+        threshold: minimum wick/range ratio to count as significant
+
+    Returns list of cluster dicts with 'count', 'price_zone', 'start_idx', 'end_idx'
+    """
+    clusters = []
+    streak = []
+
+    def _save_streak():
+        if len(streak) >= 2:
+            tips = [c[price_key] for c in streak]
+            clusters.append({
+                "count": len(streak),
+                "price_zone": sum(tips) / len(tips),
+                "price_low": min(tips),
+                "price_high": max(tips),
+                "start_idx": streak[0]["idx"],
+                "end_idx": streak[-1]["idx"],
+            })
+
+    # Compute average candle range for zone tolerance
+    ranges = [c["h"] - c["l"] for c in candles if c["h"] - c["l"] > 0]
+    avg_range = sum(ranges) / len(ranges) if ranges else 0
+    zone_tolerance = avg_range * 2.0  # wicks within 2× avg range = same zone
+
+    for candle in candles:
+        rng = candle["h"] - candle["l"]
+        if rng == 0:
+            _save_streak()
+            streak = []
+            continue
+
+        upper_wick = candle["h"] - max(candle["o"], candle["c"])
+        lower_wick = min(candle["o"], candle["c"]) - candle["l"]
+        wick = upper_wick if wick_key == "upper" else lower_wick
+        ratio = wick / rng
+
+        if ratio >= threshold:
+            # Check if this wick tip is in the same price zone as current streak
+            if streak and zone_tolerance > 0:
+                avg_tip = sum(c[price_key] for c in streak) / len(streak)
+                if abs(candle[price_key] - avg_tip) <= zone_tolerance:
+                    streak.append(candle)
+                else:
+                    _save_streak()
+                    streak = [candle]
+            else:
+                streak.append(candle)
+        else:
+            _save_streak()
+            streak = []
+
+    _save_streak()
+    return clusters
+
 
 async def analyze_1m_wicks(
     chain: str,
@@ -339,8 +407,9 @@ async def analyze_1m_wicks(
 ) -> str | None:
     """
     Fetch 60 x 1-minute candles from GeckoTerminal and detect consecutive
-    wick patterns that indicate TP (take-profit / selling pressure) or
-    accumulation (buying-the-dip pressure).
+    wick patterns that indicate potential tops (upper wick clusters at
+    similar highs = rejection/distribution) and bottoms (lower wick clusters
+    at similar lows = absorption/accumulation).
 
     Returns a human-readable analysis string to inject into the AI context,
     or None if data is unavailable / insufficient.
@@ -367,129 +436,116 @@ async def analyze_1m_wicks(
         # Sort chronological (oldest first)
         ohlcv_list.sort(key=lambda c: c[0])
 
-        # Analyze each candle for wick dominance
-        # candle: [timestamp, open, high, low, close, volume]
-        upper_wick_streaks = []  # list of streak lengths
-        lower_wick_streaks = []
-        current_upper = 0
-        current_lower = 0
-        total_upper_wick = 0
-        total_lower_wick = 0
+        # Build candle dicts
+        candles = []
+        for i, raw in enumerate(ohlcv_list):
+            _, o, h, l, c, vol = [float(x) for x in raw]
+            candles.append({"o": o, "h": h, "l": l, "c": c, "vol": vol, "idx": i})
 
-        for candle in ohlcv_list:
-            _, o, h, l, c, vol = [float(x) for x in candle]
-            body = abs(c - o)
-            full_range = h - l
+        # Detect clusters
+        top_clusters = _detect_wick_clusters(candles, "upper", "h")
+        bottom_clusters = _detect_wick_clusters(candles, "lower", "l")
 
-            if full_range == 0:
-                # Flat candle — reset streaks
-                if current_upper >= 2:
-                    upper_wick_streaks.append(current_upper)
-                if current_lower >= 2:
-                    lower_wick_streaks.append(current_lower)
-                current_upper = 0
-                current_lower = 0
-                continue
+        # Count total significant wicks
+        total_upper = sum(1 for c in candles
+                         if (c["h"] - c["l"]) > 0
+                         and (c["h"] - max(c["o"], c["c"])) / (c["h"] - c["l"]) >= 0.35)
+        total_lower = sum(1 for c in candles
+                         if (c["h"] - c["l"]) > 0
+                         and (min(c["o"], c["c"]) - c["l"]) / (c["h"] - c["l"]) >= 0.35)
 
-            upper_wick = h - max(o, c)
-            lower_wick = min(o, c) - l
-            wick_ratio_upper = upper_wick / full_range
-            wick_ratio_lower = lower_wick / full_range
-
-            # Significant upper wick: > 40% of candle range
-            if wick_ratio_upper > 0.40:
-                current_upper += 1
-                total_upper_wick += 1
-                if current_lower >= 2:
-                    lower_wick_streaks.append(current_lower)
-                current_lower = 0
-            # Significant lower wick: > 40% of candle range
-            elif wick_ratio_lower > 0.40:
-                current_lower += 1
-                total_lower_wick += 1
-                if current_upper >= 2:
-                    upper_wick_streaks.append(current_upper)
-                current_upper = 0
-            else:
-                # No dominant wick — save streaks
-                if current_upper >= 2:
-                    upper_wick_streaks.append(current_upper)
-                if current_lower >= 2:
-                    lower_wick_streaks.append(current_lower)
-                current_upper = 0
-                current_lower = 0
-
-        # Capture final streaks
-        if current_upper >= 2:
-            upper_wick_streaks.append(current_upper)
-        if current_lower >= 2:
-            lower_wick_streaks.append(current_lower)
-
-        # Calculate price change over the 60 candles
-        first_close = float(ohlcv_list[0][4])
-        last_close = float(ohlcv_list[-1][4])
+        # Price change
+        first_close = candles[0]["c"]
+        last_close = candles[-1]["c"]
         pct_change = ((last_close - first_close) / first_close * 100) if first_close else 0
 
-        # Build analysis
-        n = len(ohlcv_list)
+        # Overall high/low of the period
+        period_high = max(c["h"] for c in candles)
+        period_low = min(c["l"] for c in candles)
+
+        n = len(candles)
         lines = [
             f"=== 1-MINUTE WICK ANALYSIS (last {n} candles) ===",
             f"Price change over period: {pct_change:+.2f}%",
-            f"Candles with significant upper wicks (TP/sell pressure): {total_upper_wick}/{n}",
-            f"Candles with significant lower wicks (buy absorption): {total_lower_wick}/{n}",
+            f"Period range: low {period_low:.8g} → high {period_high:.8g}",
+            f"Upper wick candles (rejection/selling): {total_upper}/{n}",
+            f"Lower wick candles (absorption/buying): {total_lower}/{n}",
         ]
 
-        if upper_wick_streaks:
-            max_streak = max(upper_wick_streaks)
+        # Report TOP formations
+        if top_clusters:
+            best = max(top_clusters, key=lambda x: x["count"])
             lines.append(
-                f"CONSECUTIVE upper wick streaks: {upper_wick_streaks} "
-                f"(longest: {max_streak} candles in a row)"
+                f"🔴 POTENTIAL TOP DETECTED: {best['count']} consecutive upper wicks "
+                f"clustered around {best['price_zone']:.8g} "
+                f"(range {best['price_low']:.8g}–{best['price_high']:.8g})"
             )
-            if max_streak >= 4:
+            if best["count"] >= 4:
                 lines.append(
-                    "⚠️ HEAVY TP DETECTED: 4+ consecutive upper wicks = "
-                    "sustained selling pressure / distribution in progress"
+                    "⚠️ STRONG TOP SIGNAL: 4+ consecutive rejections at this level = "
+                    "heavy selling / distribution — price struggling to break through"
                 )
-            elif max_streak >= 3:
+            elif best["count"] >= 3:
                 lines.append(
-                    "⚠️ MODERATE TP SIGNALS: 3 consecutive upper wicks = "
-                    "sellers active, watch for breakdown"
+                    "⚠️ MODERATE TOP SIGNAL: 3 rejections at this level = "
+                    "sellers defending, watch for reversal"
+                )
+            if len(top_clusters) > 1:
+                lines.append(
+                    f"Total top formations found: {len(top_clusters)} "
+                    f"(streaks: {[c['count'] for c in top_clusters]})"
                 )
         else:
-            lines.append("No consecutive upper wick streaks detected (minimal TP)")
+            lines.append("No consecutive upper wick clusters (no clear top forming)")
 
-        if lower_wick_streaks:
-            max_streak = max(lower_wick_streaks)
+        # Report BOTTOM formations
+        if bottom_clusters:
+            best = max(bottom_clusters, key=lambda x: x["count"])
             lines.append(
-                f"CONSECUTIVE lower wick streaks: {lower_wick_streaks} "
-                f"(longest: {max_streak} candles in a row)"
+                f"🟢 POTENTIAL BOTTOM DETECTED: {best['count']} consecutive lower wicks "
+                f"clustered around {best['price_zone']:.8g} "
+                f"(range {best['price_low']:.8g}–{best['price_high']:.8g})"
             )
-            if max_streak >= 4:
+            if best["count"] >= 4:
                 lines.append(
-                    "🟢 STRONG ACCUMULATION: 4+ consecutive lower wicks = "
-                    "buyers absorbing every dip aggressively"
+                    "🟢 STRONG BOTTOM SIGNAL: 4+ consecutive absorptions at this level = "
+                    "buyers aggressively defending — potential reversal / accumulation zone"
                 )
-            elif max_streak >= 3:
+            elif best["count"] >= 3:
                 lines.append(
-                    "🟢 ACCUMULATION SIGNALS: 3 consecutive lower wicks = "
-                    "dip buyers active"
+                    "🟢 MODERATE BOTTOM SIGNAL: 3 absorptions at this level = "
+                    "dip buyers active, holding support"
+                )
+            if len(bottom_clusters) > 1:
+                lines.append(
+                    f"Total bottom formations found: {len(bottom_clusters)} "
+                    f"(streaks: {[c['count'] for c in bottom_clusters]})"
                 )
         else:
-            lines.append("No consecutive lower wick streaks detected (no clear accumulation)")
+            lines.append("No consecutive lower wick clusters (no clear bottom forming)")
 
-        # Overall wick dominance
-        if total_upper_wick > total_lower_wick * 1.5:
-            lines.append("OVERALL: Upper wicks dominate — sellers/TP in control")
-        elif total_lower_wick > total_upper_wick * 1.5:
-            lines.append("OVERALL: Lower wicks dominate — buyers absorbing dips")
+        # Overall assessment
+        if top_clusters and not bottom_clusters:
+            lines.append("OVERALL: Selling pressure dominant — potential top forming")
+        elif bottom_clusters and not top_clusters:
+            lines.append("OVERALL: Buying absorption dominant — potential bottom forming")
+        elif top_clusters and bottom_clusters:
+            lines.append("OVERALL: Both top and bottom signals present — choppy/ranging")
+        elif total_upper > total_lower * 1.5:
+            lines.append("OVERALL: Upper wicks frequent but no clear cluster — mild selling")
+        elif total_lower > total_upper * 1.5:
+            lines.append("OVERALL: Lower wicks frequent but no clear cluster — mild buying")
         else:
-            lines.append("OVERALL: Mixed wick signals — no clear dominance")
+            lines.append("OVERALL: No significant wick patterns — clean price action")
 
         lines.append("=========================")
 
         result = "\n".join(lines)
-        logger.info("Wick analysis complete for %s/%s: %d upper, %d lower wicks",
-                    gt_chain, pair_address[:10], total_upper_wick, total_lower_wick)
+        logger.info(
+            "Wick analysis for %s/%s: %d tops, %d bottoms detected",
+            gt_chain, pair_address[:10],
+            len(top_clusters), len(bottom_clusters),
+        )
         return result
 
     except Exception as exc:

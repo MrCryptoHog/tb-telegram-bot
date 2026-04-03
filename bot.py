@@ -193,10 +193,14 @@ You MUST focus on these KEY METRICS for degen plays:\
   • <b>Holder Count</b>: If holder data is provided, analyze distribution. \
     <200 holders = extremely early/risky. 500-2000 = growing. 5000+ = established.\
   • <b>1-Minute Wick Analysis</b>: If a WICK ANALYSIS section is provided, \
-    use it! Consecutive upper wicks on the 1m = sellers taking profit / \
-    distribution in progress. This is a KEY red flag for entries. \
-    Consecutive lower wicks = buyers absorbing dips (accumulation). \
-    Report what the wick data shows and what it means for the trade.\
+    use it! This detects consecutive candle wicks clustering at similar \
+    price levels on the 1-minute chart — the classic way to spot tops and \
+    bottoms. Consecutive upper wicks at a similar high = sellers rejecting \
+    that level = POTENTIAL TOP (distribution / reversal zone). \
+    Consecutive lower wicks at a similar low = buyers absorbing at that \
+    level = POTENTIAL BOTTOM (accumulation / support zone). \
+    Report the price zones where tops/bottoms are forming and what it \
+    means for timing entries and exits.\
   • <b>X Potential Estimate</b>: ALWAYS give a realistic X estimate from \
     current mcap with reasoning. Consider: volume trend, liquidity depth, \
     how old the token is (pair created date), and momentum.\
