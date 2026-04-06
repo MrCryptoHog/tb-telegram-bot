@@ -34,7 +34,7 @@ from telegram.ext import (
 
 from providers import ProviderManager
 from rate_limiter import RateLimiter
-from charts import screenshot_tradingview_chart, generate_dex_chart, analyze_1m_wicks
+from charts import screenshot_tradingview_chart, generate_dex_chart
 from tradingview import (
     extract_symbol,
     extract_interval,
@@ -176,39 +176,26 @@ tags, NOT Markdown. Use these tags:\
   Use line breaks and <b>bold headers</b> to structure answers.\
   Bullet points with • or numbered lists are fine as plain text.
 
-9. **Chart / Token Analysis — DEGEN FOCUS (IMPORTANT)** – When the message \
-contains a "=== LIVE TOKEN DATA ===" block, you MUST use that data to provide \
-a real analysis. This data is fetched live from DexScreener at the moment \
-of the question. Most tokens shared here are degen/micro-cap plays. \
-NEVER mention "LIVE TOKEN DATA", "data block", "wick analysis", or any \
-internal mechanism to the user — just analyze the data directly. \
-If the block is present, it means we successfully looked up their token. \
-You MUST focus on these KEY METRICS for degen plays:\
-  • <b>Market Cap</b>: State it clearly. Then estimate realistic X potential — \
-    e.g. "At $500K mcap, a 10x to $5M is possible if volume sustains, but \
-    50x+ would need major catalyst." Compare to similar tokens that have run.\
-  • <b>Volume</b>: Is 24h volume healthy vs mcap? (>30% of mcap = hot, \
-    <5% = dead). Buy:sell ratio — who's in control?\
-  • <b>Liquidity</b>: Is it sufficient? Low liq + high mcap = dangerous.\
-  • <b>Holder Count</b>: If holder data is provided, analyze distribution. \
-    <200 holders = extremely early/risky. 500-2000 = growing. 5000+ = established.\
-  • <b>1-Minute Wick Analysis</b>: If a WICK ANALYSIS section is provided, \
-    use it! This detects consecutive candle wicks clustering at similar \
-    price levels on the 1-minute chart — the classic way to spot tops and \
-    bottoms. Consecutive upper wicks at a similar high = sellers rejecting \
-    that level = POTENTIAL TOP (distribution / reversal zone). \
-    Consecutive lower wicks at a similar low = buyers absorbing at that \
-    level = POTENTIAL BOTTOM (accumulation / support zone). \
-    Report the price zones where tops/bottoms are forming and what it \
-    means for timing entries and exits.\
-  • <b>X Potential Estimate</b>: ALWAYS give a realistic X estimate from \
-    current mcap with reasoning. Consider: volume trend, liquidity depth, \
-    how old the token is (pair created date), and momentum.\
-  • Highlight rug-pull red flags: low liq, mcap/fdv mismatch, dying volume.\
-  NEVER say "I don't have access to live data" when this block is present.\
-  Remind them this is a point-in-time snapshot, not live monitoring, and DYOR.\
-  CRITICAL: Your entire response MUST be under 900 characters. A chart image \
-  is shown alongside your text, so keep it tight — bullet points, no filler.
+9. **DEX Token Analysis (IMPORTANT)** – When the message contains a \
+"=== LIVE TOKEN DATA ===" block, analyze it like a sharp degen trader would. \
+The data is REAL, fetched live from DexScreener just now. A chart image is \
+attached alongside your text. NEVER mention "LIVE TOKEN DATA", "data block", \
+or any internal mechanism — just analyze directly.\
+\
+The data includes pre-computed flags (🔥 HOT, 💀 DEAD VOLUME, ⚠️ warnings, \
+🟢 BUYERS / 🔴 SELLERS). Use them. Your analysis MUST cover:\
+  • Price + chain + token name up front\
+  • Volume health: the Vol/MCap ratio and its tag tell you if the token is \
+    actively traded or dying. Dead volume = exit.\
+  • Buy/sell pressure: who controls the order flow right now?\
+  • Liquidity: thin liq means massive slippage on any real size. Flag it.\
+  • MCap vs FDV: if there's an unlock warning, that's a major risk.\
+  • Age: brand new (<1h) = maximum risk. Days old with declining vol = fading.\
+  • Red flags: combine the signals. Low liq + dead vol + sell pressure = avoid.\
+  • The chart shows candles + volume bars — reference what you see.\
+  Give a blunt, honest verdict. Don't sugarcoat. End with DYOR.\
+  CRITICAL: Your entire response MUST be under 900 characters. Keep it tight — \
+  bullet points, no filler, no essays.
 
 10. **TradingView Technical Analysis (IMPORTANT)** – When the message contains a \
 "=== LIVE TRADINGVIEW TECHNICAL ANALYSIS ===" block, you MUST provide a \
@@ -357,10 +344,40 @@ async def fetch_dexscreener_by_token(token_address: str) -> tuple[dict | None, s
         return None, None, None
 
 
+def _humanize_age(epoch_ms: int | None) -> str:
+    """Convert a millisecond epoch timestamp to a human-readable age string."""
+    if not epoch_ms:
+        return "unknown"
+    import time as _t
+    diff = _t.time() - epoch_ms / 1000
+    if diff < 0:
+        return "just now"
+    if diff < 3600:
+        return f"{int(diff / 60)}m old"
+    if diff < 86400:
+        return f"{diff / 3600:.1f}h old"
+    if diff < 2592000:
+        return f"{diff / 86400:.1f}d old"
+    return f"{diff / 2592000:.0f}mo old"
+
+
+def _fmt_usd(val: float | int | None) -> str:
+    """Format a USD value in short human form: $1.2M, $450K, $89."""
+    if val is None:
+        return "N/A"
+    if val >= 1_000_000_000:
+        return f"${val / 1_000_000_000:.2f}B"
+    if val >= 1_000_000:
+        return f"${val / 1_000_000:.2f}M"
+    if val >= 1_000:
+        return f"${val / 1_000:.1f}K"
+    return f"${val:,.2f}"
+
+
 def format_dexscreener_context(pair: dict) -> str:
     """
-    Format DexScreener pair data into a readable context block
-    that gets injected into the AI prompt.
+    Format DexScreener pair data into a concise context block with
+    pre-computed derived metrics that matter for degen token analysis.
     """
     base = pair.get("baseToken", {})
     quote = pair.get("quoteToken", {})
@@ -368,47 +385,91 @@ def format_dexscreener_context(pair: dict) -> str:
     volume = pair.get("volume", {})
     liquidity = pair.get("liquidity", {})
     txns = pair.get("txns", {})
+    mcap = pair.get("marketCap")
+    fdv = pair.get("fdv")
 
-    # Format transaction data
-    txn_lines = []
-    for period, label in [("m5", "5min"), ("h1", "1hr"), ("h6", "6hr"), ("h24", "24hr")]:
-        t = txns.get(period, {})
-        if t:
-            txn_lines.append(f"  {label}: {t.get('buys', '?')} buys / {t.get('sells', '?')} sells")
+    # ── Derived metrics ──
+    vol_24h = volume.get("h24") or 0
+    liq_usd = liquidity.get("usd") or 0
+
+    # Volume / MCap ratio (how actively traded relative to size)
+    vol_mcap_pct = (vol_24h / mcap * 100) if mcap and mcap > 0 else None
+    vol_mcap_tag = ""
+    if vol_mcap_pct is not None:
+        if vol_mcap_pct > 100:
+            vol_mcap_tag = " 🔥 EXTREMELY HOT"
+        elif vol_mcap_pct > 30:
+            vol_mcap_tag = " 🔥 HOT"
+        elif vol_mcap_pct > 10:
+            vol_mcap_tag = " ✅ HEALTHY"
+        elif vol_mcap_pct > 3:
+            vol_mcap_tag = " ⚠️ COOLING"
+        else:
+            vol_mcap_tag = " 💀 DEAD VOLUME"
+
+    # Liquidity / MCap ratio (thin liq = slippage risk)
+    liq_mcap_pct = (liq_usd / mcap * 100) if mcap and mcap > 0 else None
+    liq_tag = ""
+    if liq_mcap_pct is not None:
+        if liq_mcap_pct < 3:
+            liq_tag = " ⚠️ PAPER-THIN"
+        elif liq_mcap_pct < 8:
+            liq_tag = " ⚠️ LOW"
+
+    # MCap vs FDV mismatch (token unlock risk)
+    unlock_warning = ""
+    if mcap and fdv and fdv > 0 and mcap > 0:
+        ratio = mcap / fdv
+        if ratio < 0.5:
+            unlock_warning = f" ⚠️ Only {ratio:.0%} circulating — heavy unlock risk"
+
+    # Buy pressure from 24h transactions
+    t24 = txns.get("h24", {})
+    buys_24 = t24.get("buys", 0) or 0
+    sells_24 = t24.get("sells", 0) or 0
+    total_txns_24 = buys_24 + sells_24
+    buy_pct = (buys_24 / total_txns_24 * 100) if total_txns_24 > 0 else None
+
+    # Short-term momentum: 1h transactions
+    t1h = txns.get("h1", {})
+    buys_1h = t1h.get("buys", 0) or 0
+    sells_1h = t1h.get("sells", 0) or 0
+
+    # Token age
+    age = _humanize_age(pair.get("pairCreatedAt"))
 
     lines = [
-        f"=== LIVE TOKEN DATA (from DexScreener) ===",
-        f"IMPORTANT: This is REAL live data fetched just now. Analyze it using Rule 9.",
-        f"Token: {base.get('name', '?')} ({base.get('symbol', '?')})",
-        f"Pair: {base.get('symbol', '?')}/{quote.get('symbol', '?')}",
-        f"Chain: {pair.get('chainId', '?')}",
-        f"DEX: {pair.get('dexId', '?')}",
-        f"Price (USD): ${pair.get('priceUsd', '?')}",
-        f"Price ({quote.get('symbol', 'quote')}): {pair.get('priceNative', '?')}",
+        f"=== LIVE TOKEN DATA ===",
+        f"Token: {base.get('name', '?')} ({base.get('symbol', '?')}) on {pair.get('chainId', '?')}",
+        f"DEX: {pair.get('dexId', '?')} | Age: {age}",
+        f"Price: ${pair.get('priceUsd', '?')}",
         f"",
-        f"Price Changes:",
-        f"  5min:  {price_change.get('m5', '?')}%",
-        f"  1hr:   {price_change.get('h1', '?')}%",
-        f"  6hr:   {price_change.get('h6', '?')}%",
-        f"  24hr:  {price_change.get('h24', '?')}%",
+        f"MCap: {_fmt_usd(mcap)}",
+        f"FDV: {_fmt_usd(fdv)}{unlock_warning}",
+        f"Liquidity: {_fmt_usd(liq_usd)}{liq_tag}",
         f"",
-        f"Volume:",
-        f"  5min:  ${volume.get('m5', '?')}",
-        f"  1hr:   ${volume.get('h1', '?')}",
-        f"  6hr:   ${volume.get('h6', '?')}",
-        f"  24hr:  ${volume.get('h24', '?')}",
-        f"",
-        f"Transactions:",
+        f"24h Volume: {_fmt_usd(vol_24h)}",
     ]
-    lines.extend(txn_lines if txn_lines else ["  No transaction data available"])
-    lines.extend([
-        f"",
-        f"Liquidity (USD): ${liquidity.get('usd', '?')}",
-        f"Market Cap: ${pair.get('marketCap', '?')}" if pair.get('marketCap') else "Market Cap: N/A",
-        f"FDV: ${pair.get('fdv', '?')}" if pair.get('fdv') else "FDV: N/A",
-        f"Pair created: {pair.get('pairCreatedAt', 'unknown')}",
-        f"=========================",
-    ])
+    if vol_mcap_pct is not None:
+        lines.append(f"Vol/MCap: {vol_mcap_pct:.1f}%{vol_mcap_tag}")
+    if liq_mcap_pct is not None:
+        lines.append(f"Liq/MCap: {liq_mcap_pct:.1f}%")
+
+    lines.append("")
+    lines.append("Price Action:")
+    for key, label in [("m5", "5m"), ("h1", "1h"), ("h6", "6h"), ("h24", "24h")]:
+        pct = price_change.get(key)
+        if pct is not None:
+            arrow = "📈" if pct > 0 else "📉" if pct < 0 else "➡️"
+            lines.append(f"  {label}: {pct:+.2f}% {arrow}")
+
+    lines.append("")
+    if buy_pct is not None:
+        pressure = "🟢 BUYERS" if buy_pct > 55 else "🔴 SELLERS" if buy_pct < 45 else "⚖️ BALANCED"
+        lines.append(f"24h Txns: {buys_24} buys / {sells_24} sells ({buy_pct:.0f}% buy) {pressure}")
+    lines.append(f"1h Txns: {buys_1h} buys / {sells_1h} sells")
+
+    lines.append(f"=========================")
     return "\n".join(lines)
 
 # ── Response cache (saves rate limits for repeated questions) ────────────────
@@ -832,17 +893,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           f"and suggest they double-check the address or try again later.]")
             logger.warning("DexScreener returned no data for token %s", raw_ca)
 
-    # ── Fetch 1-minute wick analysis for degen tokens (parallel-safe) ──
-    wick_context = ""
-    if chain and pair_addr and dex_context:
-        try:
-            wick_data = await analyze_1m_wicks(chain, pair_addr)
-            if wick_data:
-                wick_context = "\n\n" + wick_data
-                logger.info("Wick analysis attached (%d bytes)", len(wick_context))
-        except Exception as exc:
-            logger.warning("Wick analysis error (non-fatal): %s", exc)
-
     # ── Check for TradingView TA request → fetch live indicators + chart ──
     tv_context = ""
     interval = None
@@ -890,7 +940,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("TradingView returned no data for %s", tv_symbol.symbol)
 
     # ── Query AI with multi-provider fallback ──
-    live_context = dex_context + wick_context + tv_context
+    live_context = dex_context + tv_context
 
     prompt = f"[Group member {user_name} asks]: {user_text}{live_context}"
 
