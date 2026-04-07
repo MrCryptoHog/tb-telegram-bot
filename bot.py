@@ -442,8 +442,6 @@ def format_dexscreener_context(pair: dict) -> str:
         f"=== LIVE TOKEN DATA ===",
         f"Token: {base.get('name', '?')} ({base.get('symbol', '?')}) on {pair.get('chainId', '?')}",
         f"DEX: {pair.get('dexId', '?')} | Age: {age}",
-        f"Price: ${pair.get('priceUsd', '?')}",
-        f"",
         f"MCap: {_fmt_usd(mcap)}",
         f"FDV: {_fmt_usd(fdv)}{unlock_warning}",
         f"Liquidity: {_fmt_usd(liq_usd)}{liq_tag}",
@@ -456,7 +454,7 @@ def format_dexscreener_context(pair: dict) -> str:
         lines.append(f"Liq/MCap: {liq_mcap_pct:.1f}%")
 
     lines.append("")
-    lines.append("Price Action:")
+    lines.append("MCap Action:")
     for key, label in [("m5", "5m"), ("h1", "1h"), ("h6", "6h"), ("h24", "24h")]:
         pct = price_change.get(key)
         if pct is not None:
