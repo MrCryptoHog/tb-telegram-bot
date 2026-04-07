@@ -184,7 +184,7 @@ or any internal mechanism — just analyze directly.\
 \
 The data includes pre-computed flags (🔥 HOT, 💀 DEAD VOLUME, ⚠️ warnings, \
 🟢 BUYERS / 🔴 SELLERS). Use them. Your analysis MUST cover:\
-  • Price + chain + token name up front\
+  • Market Cap + chain + token name up front (NEVER mention price — we use MCap)\
   • Volume health: the Vol/MCap ratio and its tag tell you if the token is \
     actively traded or dying. Dead volume = exit.\
   • Buy/sell pressure: who controls the order flow right now?\
